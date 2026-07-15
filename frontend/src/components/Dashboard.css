@@ -1,0 +1,294 @@
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 30px;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.15);
+  padding-bottom: 20px;
+}
+
+.title {
+  font-size: 24px;
+  font-weight: 800;
+  color: #00d4ff;
+}
+
+.logout-btn {
+  background: #f44336;
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.logout-btn:hover {
+  background: #d32f2f;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 30px;
+}
+
+.stat-card {
+  background: #101f30;
+  border: 1px solid #17324a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.stat-label {
+  font-size: 11px;
+  color: #00d4ff;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.stat-value {
+  font-size: 24px;
+  font-weight: 800;
+  color: #4caf50;
+}
+
+.card {
+  background: #101f30;
+  border: 1px solid #17324a;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.card-title {
+  font-size: 16px;
+  font-weight: 800;
+  color: #00d4ff;
+  margin-bottom: 16px;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-row label {
+  font-size: 12px;
+  color: #00d4ff;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.form-row textarea {
+  width: 100%;
+  height: 120px;
+  background: #0c1c2c;
+  color: #b8c9d9;
+  border: 1px solid #17324a;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.form-row textarea:focus {
+  outline: none;
+  border-color: #00d4ff;
+}
+
+.btn {
+  background: #1976d2;
+  color: #fff;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.btn:hover {
+  background: #1565c0;
+}
+
+.btn-primary {
+  background: #00d4ff;
+  color: #04121f;
+}
+
+.btn-primary:hover {
+  background: #00b8cc;
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.tbl-outer {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead th {
+  background: #0e2233;
+  color: #00d4ff;
+  padding: 12px;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  text-align: left;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.15);
+}
+
+td {
+  padding: 12px;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.08);
+  vertical-align: top;
+}
+
+.row-num {
+  font-size: 18px;
+  font-weight: 800;
+  color: #fff;
+}
+
+.addr-full {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  color: #a8d8ff;
+  word-break: break-all;
+}
+
+.wallet-label {
+  font-size: 11px;
+  color: #00d4ff;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.copy-link {
+  background: none;
+  border: none;
+  color: #5aa;
+  font-size: 10px;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  margin-top: 4px;
+}
+
+.bal-val {
+  font-size: 18px;
+  font-weight: 800;
+  color: #4caf50;
+}
+
+.bal-sub {
+  font-size: 11px;
+  color: #778;
+  margin-top: 2px;
+}
+
+.status-active {
+  color: #4caf50;
+  font-weight: 800;
+}
+
+.status-wait {
+  color: #ffc107;
+  font-weight: 800;
+}
+
+.status-err {
+  color: #f44336;
+  font-weight: 800;
+}
+
+.remove-btn {
+  background: #f44336;
+  color: #fff;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+.remove-btn:hover {
+  background: #d32f2f;
+}
+
+.expand-btn {
+  background: none;
+  border: none;
+  color: #00d4ff;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 4px 0;
+  margin-top: 4px;
+}
+
+.empty {
+  text-align: center;
+  padding: 30px;
+  color: #556;
+}
+
+.cb-table {
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.cb-table th {
+  background: #0c1c2c;
+  padding: 6px 10px;
+}
+
+.cb-table td {
+  padding: 6px 10px;
+}
+
+.unlock-now {
+  color: #4caf50;
+  font-weight: 700;
+}
+
+.unlock-pending {
+  color: #ffc107;
+  font-weight: 700;
+}
+
+.unlock-remaining {
+  font-size: 10px;
+  color: #ff9800;
+}
+
+.no-unlock {
+  color: #556;
+}
+
+.updated-time {
+  font-size: 10px;
+  color: #556;
+}
