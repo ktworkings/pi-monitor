@@ -1,4 +1,4 @@
-const API_BASE = '';
+const API_BASE = 'https://pi-monitor-ny8e.onrender.com';
 
 export function getToken() {
   return localStorage.getItem('authToken');
