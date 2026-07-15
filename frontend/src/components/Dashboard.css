@@ -36,7 +36,7 @@
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 16px;
   margin-bottom: 30px;
 }
@@ -46,6 +46,11 @@
   border: 1px solid #17324a;
   border-radius: 8px;
   padding: 16px;
+}
+
+.stat-card-alert {
+  border-color: #ff9800;
+  background: #1a1800;
 }
 
 .stat-label {
@@ -60,6 +65,16 @@
   font-size: 24px;
   font-weight: 800;
   color: #4caf50;
+}
+
+.stat-value-alert {
+  color: #ff9800;
+}
+
+.stat-sub {
+  font-size: 11px;
+  color: #ff9800;
+  margin-top: 4px;
 }
 
 .card {
@@ -170,6 +185,11 @@ td {
   color: #fff;
 }
 
+.row-unclaimed {
+  background: rgba(255, 152, 0, 0.06);
+  border-left: 3px solid #ff9800;
+}
+
 .addr-full {
   font-family: 'Courier New', monospace;
   font-size: 12px;
@@ -208,6 +228,38 @@ td {
   margin-top: 2px;
 }
 
+.unclaimed-badge {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgba(255, 152, 0, 0.15);
+  border: 1px solid #ff9800;
+  border-radius: 4px;
+  color: #ff9800;
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-block;
+}
+
+.lockup-info {
+  margin-bottom: 6px;
+}
+
+.lockup-count {
+  font-size: 12px;
+  font-weight: 700;
+  color: #b8c9d9;
+}
+
+.next-unlock {
+  margin-top: 4px;
+}
+
+.next-unlock-label {
+  font-size: 10px;
+  color: #778;
+  text-transform: uppercase;
+}
+
 .status-active {
   color: #4caf50;
   font-weight: 800;
@@ -221,6 +273,17 @@ td {
 .status-err {
   color: #f44336;
   font-weight: 800;
+}
+
+.status-unclaimed {
+  color: #ff9800;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.status-locked {
+  color: #778;
+  font-size: 11px;
 }
 
 .remove-btn {
@@ -247,6 +310,7 @@ td {
   text-decoration: underline;
   padding: 4px 0;
   margin-top: 4px;
+  display: block;
 }
 
 .empty {
@@ -258,20 +322,30 @@ td {
 .cb-table {
   font-size: 12px;
   margin-top: 8px;
+  width: 100%;
 }
 
 .cb-table th {
   background: #0c1c2c;
   padding: 6px 10px;
+  color: #00d4ff;
+  font-size: 10px;
+  text-transform: uppercase;
 }
 
 .cb-table td {
   padding: 6px 10px;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.05);
+}
+
+.cb-unlocked {
+  background: rgba(255, 152, 0, 0.08);
 }
 
 .unlock-now {
-  color: #4caf50;
+  color: #ff9800;
   font-weight: 700;
+  font-size: 13px;
 }
 
 .unlock-pending {
@@ -286,6 +360,7 @@ td {
 
 .no-unlock {
   color: #556;
+  font-size: 12px;
 }
 
 .updated-time {

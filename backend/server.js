@@ -5,7 +5,7 @@
  * - Phrases live only in a JS Map in RAM, nothing written to disk
  * - Every ~30s polls Horizon for balances and claimable balances
  * - Email alerts via Brevo SMTP on: new claimable balance,
- *   ~24h/~2h before unlock, and any payment in/out (with tx hash)
+ *   ~24h/~2h before unlock, payment in/out, and unlocked-but-unclaimed
  * - Read-only, never builds or submits transactions
  * ---------------------------------------------------------------
  */
@@ -35,18 +35,13 @@ const CONFIG = {
   HORIZON_URL: process.env.HORIZON_URL || 'https://api.mainnet.minepi.com',
   POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS) || 30000,
   RESERVE_PI: parseInt(process.env.RESERVE_PI) || 1,
-
-  // Brevo API
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',
   EMAIL_FROM_NAME: process.env.EMAIL_FROM_NAME || 'Pi Wallet Monitor',
   EMAIL_FROM_ADDRESS: process.env.EMAIL_FROM_ADDRESS || '',
   EMAIL_TO: process.env.EMAIL_TO || '',
-
   DASH_USER: process.env.DASH_USER || 'admin',
   DASH_PASS: process.env.DASH_PASS || 'password123',
 };
-
-// ════════════════════════════════════════════════════════════════
 
 const PI_DERIVATION_PATH = "m/44'/314159'/0'";
 const REMINDER_24H_MS = 24 * 60 * 60 * 1000;
@@ -63,6 +58,8 @@ const snapshot = {};
 const claimableTracked = new Map();
 const seenPayments = new Set();
 const sessions = new Map();
+// Track which claimable balances we've sent "unlocked but unclaimed" alerts for
+const unclaimedNotified = new Set();
 
 function deriveKeypair(phrase) {
   const seed = bip39.mnemonicToSeedSync(phrase);
@@ -119,6 +116,51 @@ function emailHtml({ icon, title, accent, rows, footerNote }) {
   </body></html>`;
 }
 
+/**
+ * Correctly evaluate a claimant predicate to determine the unlock time.
+ * Pi Network uses predicates like:
+ *   { and: [{ not: { abs_before: "TIME" } }] } — meaning claimable AFTER TIME
+ *   { abs_before: "TIME" } — meaning claimable BEFORE TIME (deadline, not lock)
+ * 
+ * We look for the LATEST "not before" time, which is the actual lock expiry.
+ * If there's only an abs_before without not, that's a deadline (must claim before).
+ */
+function evaluatePredicate(predicate) {
+  if (!predicate) return { unlock_time: null, is_claimable_now: true };
+
+  let lockUntil = null;   // The time after which it becomes claimable
+  let deadline = null;    // The time before which it must be claimed
+
+  function walk(pred, negated) {
+    if (!pred) return;
+    if (pred.unconditional) return;
+
+    if (pred.abs_before) {
+      if (negated) {
+        // not(abs_before(T)) means "not claimable before T" = locked until T
+        const t = new Date(pred.abs_before).getTime();
+        if (!lockUntil || t > lockUntil) lockUntil = t;
+      } else {
+        // abs_before(T) means "claimable before T" = deadline
+        const t = new Date(pred.abs_before).getTime();
+        if (!deadline || t < deadline) deadline = t;
+      }
+    }
+
+    if (pred.not) walk(pred.not, !negated);
+    if (pred.and) pred.and.forEach(p => walk(p, negated));
+    if (pred.or) pred.or.forEach(p => walk(p, negated));
+  }
+
+  walk(predicate, false);
+
+  const now = Date.now();
+  const unlock_time = lockUntil ? new Date(lockUntil).toISOString() : null;
+  const is_claimable_now = lockUntil ? now >= lockUntil : true;
+
+  return { unlock_time, is_claimable_now, deadline: deadline ? new Date(deadline).toISOString() : null };
+}
+
 async function pollWallet(w) {
   if (!w) return;
   const h = new HorizonServer(CONFIG.HORIZON_URL);
@@ -133,6 +175,8 @@ async function pollWallet(w) {
         raw_balance: '0.0000000',
         claimable_total: '0.0000000',
         claimables: [],
+        lockup_count: 0,
+        unlocked_unclaimed: [],
         updated_at: new Date().toISOString(),
         error: null
       };
@@ -145,27 +189,27 @@ async function pollWallet(w) {
     const cbs = await h.claimableBalances().claimant(w.public_key).call().catch(() => ({ records: [] }));
     let claimableTotal = 0;
     const claimables = [];
+    const unlockedUnclaimed = [];
 
     for (const cb of cbs.records) {
       claimableTotal += parseFloat(cb.amount);
-      let unlockTime = null;
 
-      function extractAbsBefore(pred) {
-        if (!pred) return null;
-        if (pred.abs_before) return pred.abs_before;
-        if (pred.not && pred.not.abs_before) return pred.not.abs_before;
-        if (pred.and) for (let p of pred.and) { let t = extractAbsBefore(p); if (t) return t; }
-        if (pred.or) for (let p of pred.or) { let t = extractAbsBefore(p); if (t) return t; }
-        return null;
-      }
+      // Find the claimant predicate for THIS wallet
+      const claimant = cb.claimants.find(c => c.destination === w.public_key);
+      const pred = claimant ? claimant.predicate : null;
+      const { unlock_time, is_claimable_now } = evaluatePredicate(pred);
 
-      if (cb.predicate) unlockTime = extractAbsBefore(cb.predicate);
-
-      claimables.push({
+      const cbEntry = {
         id: cb.id,
         amount: cb.amount,
-        unlock_time: unlockTime ? new Date(unlockTime).toISOString() : null,
-      });
+        unlock_time,
+        is_claimable_now,
+      };
+      claimables.push(cbEntry);
+
+      if (is_claimable_now) {
+        unlockedUnclaimed.push(cbEntry);
+      }
     }
 
     snapshot[id] = {
@@ -173,11 +217,37 @@ async function pollWallet(w) {
       available_balance: availBal.toFixed(7),
       raw_balance: parseFloat(rawBal).toFixed(7),
       claimable_total: claimableTotal.toFixed(7),
-      claimables: claimables,
+      claimables,
+      lockup_count: claimables.length,
+      unlocked_unclaimed: unlockedUnclaimed,
       updated_at: new Date().toISOString(),
       error: null
     };
 
+    // Send "unlocked but unclaimed" email alerts
+    const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
+    for (const uc of unlockedUnclaimed) {
+      const notifKey = `${w.id}:${uc.id}`;
+      if (!unclaimedNotified.has(notifKey)) {
+        unclaimedNotified.add(notifKey);
+        await sendEmail(
+          `🔓 Unlocked but unclaimed — ${phrasePreview}`,
+          `Phrase: ${phrasePreview}\nAmount: ${uc.amount} PI\nStatus: Unlocked but NOT moved to available balance\nAddress: ${w.public_key}`,
+          emailHtml({
+            icon: '🔓', title: 'Unlocked But Unclaimed', accent: '#ff9800',
+            rows: [
+              { label: 'Phrase', value: phrasePreview, mono: true },
+              { label: 'Amount', value: `${uc.amount} PI`, big: true },
+              { label: 'Status', value: 'Coins are unlocked but have NOT been moved to available balance' },
+              { label: 'Address', value: w.public_key, mono: true },
+              { label: 'Unlock Time', value: uc.unlock_time ? new Date(uc.unlock_time).toLocaleString() : 'No lock (always claimable)' },
+            ],
+          })
+        );
+      }
+    }
+
+    // Payment tracking
     let isFirstPoll = !w.last_payment_cursor;
     const payments = await h.payments().forAccount(w.public_key).order('desc').limit(10).call().catch(() => ({ records: [] }));
     for (const p of payments.records) {
@@ -188,7 +258,6 @@ async function pollWallet(w) {
       const direction = p.to === w.public_key ? 'IN' : (p.from === w.public_key ? 'OUT' : '?');
       const amt = p.amount || p.starting_balance || '?';
       const txHash = p.transaction_hash;
-      const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
 
       await sendEmail(
         `${direction === 'IN' ? '🟢' : '🔴'} Pi ${direction} — ${phrasePreview}`,
@@ -211,14 +280,16 @@ async function pollWallet(w) {
     if (payments.records.length) w.last_payment_cursor = payments.records[0].paging_token;
     else if (isFirstPoll) w.last_payment_cursor = 'checked';
 
-    // Process claimables for unlock notifications
+    // Claimable balance unlock notifications (24h and 2h reminders)
     for (const cb of claimables) {
+      if (cb.is_claimable_now) continue; // Already unlocked, no reminder needed
+
       let tracked = claimableTracked.get(cb.id);
       if (!tracked) {
-        tracked = { wallet_id: w.id, amount: cb.amount, unlock_time: cb.unlock_time, notified_24h: false, notified_2h: false };
+        tracked = { wallet_id: w.id, amount: cb.amount, unlock_time: cb.unlock_time, notified_new: false, notified_24h: false, notified_2h: false };
         claimableTracked.set(cb.id, tracked);
-        const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
 
+        // New claimable balance detected
         await sendEmail(
           `🟢 New claimable balance — ${phrasePreview}`,
           `Phrase: ${phrasePreview}\nAmount: ${cb.amount} PI\nUnlock: ${cb.unlock_time || 'Already claimable'}`,
@@ -232,11 +303,11 @@ async function pollWallet(w) {
             ],
           })
         );
+        tracked.notified_new = true;
         continue;
       }
 
       if (cb.unlock_time) {
-        const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
         const msLeft = new Date(cb.unlock_time).getTime() - Date.now();
 
         if (!tracked.notified_24h && msLeft <= REMINDER_24H_MS && msLeft > REMINDER_24H_MS - REMINDER_WINDOW_MS) {
@@ -275,7 +346,14 @@ async function pollWallet(w) {
       }
     }
   } catch (e) {
-    snapshot[id] = { error: e.message, account_exists: false, updated_at: new Date().toISOString() };
+    // Only update snapshot with error if we don't already have valid data
+    if (!snapshot[id] || !snapshot[id].account_exists) {
+      snapshot[id] = { error: e.message, account_exists: false, updated_at: new Date().toISOString() };
+    } else {
+      // Keep existing data, just note the error
+      snapshot[id].error = e.message;
+      snapshot[id].updated_at = new Date().toISOString();
+    }
   }
 }
 
@@ -311,21 +389,17 @@ app.post('/api/wallets', authRequired, async (req, res) => {
     const { phrases } = req.body || {};
     if (!phrases || !phrases.trim()) return res.status(400).json({ success: false, error: 'phrases required' });
 
-    // Split on newlines first
     let phraseList = phrases.split(/\r?\n/).map(p => p.trim()).filter(p => p.length > 0);
 
-    // If a line has more than 24 words, it might contain multiple phrases concatenated.
-    // Split lines with >24 words into chunks of 24 words each.
+    // Auto-split lines with multiple phrases concatenated
     const expanded = [];
     for (const line of phraseList) {
       const words = line.split(/\s+/).filter(w => w.length > 0);
       if (words.length > 24 && words.length % 24 === 0) {
-        // Multiple 24-word phrases on one line
         for (let i = 0; i < words.length; i += 24) {
           expanded.push(words.slice(i, i + 24).join(' '));
         }
       } else if (words.length > 24 && words.length % 12 === 0 && words.length % 24 !== 0) {
-        // Could be 12-word phrases
         for (let i = 0; i < words.length; i += 12) {
           expanded.push(words.slice(i, i + 12).join(' '));
         }
@@ -345,8 +419,7 @@ app.post('/api/wallets', authRequired, async (req, res) => {
         const preview = getPhrasePreview(phrase);
         const label = kp.publicKey().slice(0, 8);
         const w = {
-          id,
-          label,
+          id, label,
           phrase: phrase.trim(),
           phrase_preview: preview,
           public_key: kp.publicKey(),
@@ -368,18 +441,25 @@ app.post('/api/wallets', authRequired, async (req, res) => {
 });
 
 app.get('/api/wallets', authRequired, (req, res) => {
+  const now = Date.now();
+
   const list = Array.from(wallets.values()).map(w => {
     const snap = snapshot[w.id] || {};
+    const claimables = snap.claimables || [];
+
+    // Compute earliest unlock (only for still-locked items)
     let earliest_unlock = null;
-    if (snap.claimables && snap.claimables.length > 0) {
-      const unlockTimes = snap.claimables
-        .map(cb => cb.unlock_time)
-        .filter(t => t !== null);
-      if (unlockTimes.length > 0) {
-        unlockTimes.sort((a, b) => new Date(a) - new Date(b));
-        earliest_unlock = unlockTimes[0];
-      }
+    const lockedItems = claimables.filter(cb => !cb.is_claimable_now && cb.unlock_time);
+    if (lockedItems.length > 0) {
+      lockedItems.sort((a, b) => new Date(a.unlock_time) - new Date(b.unlock_time));
+      earliest_unlock = lockedItems[0].unlock_time;
     }
+
+    // Count unlocked but unclaimed
+    const unlockedUnclaimed = claimables.filter(cb => cb.is_claimable_now);
+    const unlocked_unclaimed_count = unlockedUnclaimed.length;
+    const unlocked_unclaimed_total = unlockedUnclaimed.reduce((sum, cb) => sum + parseFloat(cb.amount), 0).toFixed(7);
+
     return {
       id: w.id,
       label: w.label,
@@ -391,15 +471,42 @@ app.get('/api/wallets', authRequired, (req, res) => {
       raw_balance: '0.0000000',
       claimable_total: '0.0000000',
       claimables: [],
+      lockup_count: 0,
       error: null,
       updated_at: null,
       ...snap,
       earliest_unlock,
+      unlocked_unclaimed_count,
+      unlocked_unclaimed_total,
     };
-  }).sort((a, b) => {
-    if (a.earliest_unlock && b.earliest_unlock) return new Date(a.earliest_unlock) - new Date(b.earliest_unlock);
-    if (a.earliest_unlock && !b.earliest_unlock) return -1;
-    if (!a.earliest_unlock && b.earliest_unlock) return 1;
+  });
+
+  // Sorting priority:
+  // 1. Wallets with unlocked-but-unclaimed coins (highest priority)
+  // 2. Wallets with upcoming unlocks (closest unlock first)
+  // 3. Wallets with no unlocks (at the bottom)
+  list.sort((a, b) => {
+    const aHasUnclaimed = a.unlocked_unclaimed_count > 0;
+    const bHasUnclaimed = b.unlocked_unclaimed_count > 0;
+    const aHasUpcoming = !!a.earliest_unlock;
+    const bHasUpcoming = !!b.earliest_unlock;
+
+    // Unclaimed always on top
+    if (aHasUnclaimed && !bHasUnclaimed) return -1;
+    if (!aHasUnclaimed && bHasUnclaimed) return 1;
+    if (aHasUnclaimed && bHasUnclaimed) {
+      // Both have unclaimed — sort by unclaimed amount descending
+      return parseFloat(b.unlocked_unclaimed_total) - parseFloat(a.unlocked_unclaimed_total);
+    }
+
+    // Then upcoming unlocks (closest first)
+    if (aHasUpcoming && !bHasUpcoming) return -1;
+    if (!aHasUpcoming && bHasUpcoming) return 1;
+    if (aHasUpcoming && bHasUpcoming) {
+      return new Date(a.earliest_unlock) - new Date(b.earliest_unlock);
+    }
+
+    // No unlocks — sort by created date (newest first)
     return new Date(b.created_at) - new Date(a.created_at);
   });
 
@@ -407,8 +514,10 @@ app.get('/api/wallets', authRequired, (req, res) => {
     acc.available += parseFloat(w.available_balance || 0);
     acc.claimable += parseFloat(w.claimable_total || 0);
     acc.claimableCount += (w.claimables || []).length;
+    acc.unclaimedCount += w.unlocked_unclaimed_count || 0;
+    acc.unclaimedTotal += parseFloat(w.unlocked_unclaimed_total || 0);
     return acc;
-  }, { available: 0, claimable: 0, claimableCount: 0 });
+  }, { available: 0, claimable: 0, claimableCount: 0, unclaimedCount: 0, unclaimedTotal: 0 });
 
   res.json({
     success: true,
@@ -418,6 +527,8 @@ app.get('/api/wallets', authRequired, (req, res) => {
       total_available: totals.available.toFixed(7),
       total_claimable: totals.claimable.toFixed(7),
       total_claimable_count: totals.claimableCount,
+      total_unlocked_unclaimed: totals.unclaimedTotal.toFixed(7),
+      total_unlocked_unclaimed_count: totals.unclaimedCount,
     },
   });
 });

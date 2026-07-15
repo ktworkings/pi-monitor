@@ -2,22 +2,26 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { getWallets, addWallets, deleteWallet } from '../api';
 import './Dashboard.css';
 
-function formatUnlock(isoStr) {
-  if (!isoStr) return <span className="no-unlock">No unlock pending</span>;
+function formatUnlock(isoStr, isClaimableNow) {
+  if (isClaimableNow) return <span className="unlock-now">🔓 Claimable NOW</span>;
+  if (!isoStr) return <span className="no-unlock">No lock</span>;
+
   const d = new Date(isoStr);
   const diff = d.getTime() - Date.now();
 
-  if (diff <= 0) return <span className="unlock-now">Claimable NOW</span>;
+  if (diff <= 0) return <span className="unlock-now">🔓 Claimable NOW</span>;
 
   const hrs = Math.floor(diff / 3600000);
   const mins = Math.floor((diff % 3600000) / 60000);
-  const remaining = hrs > 24 ? `${Math.floor(hrs / 24)}d ${hrs % 24}h` : `${hrs}h ${mins}m`;
+  const remaining = hrs > 24
+    ? `${Math.floor(hrs / 24)}d ${hrs % 24}h`
+    : `${hrs}h ${mins}m`;
 
   return (
     <>
       <span className="unlock-pending">{d.toLocaleString()}</span>
       <br />
-      <span className="unlock-remaining">in {remaining}</span>
+      <span className="unlock-remaining">🔒 in {remaining}</span>
     </>
   );
 }
@@ -31,13 +35,19 @@ function ClaimablesTable({ claimables }) {
         <tr>
           <th>Amount</th>
           <th>Unlock Time</th>
+          <th>Status</th>
         </tr>
       </thead>
       <tbody>
         {claimables.map((cb) => (
-          <tr key={cb.id}>
+          <tr key={cb.id} className={cb.is_claimable_now ? 'cb-unlocked' : ''}>
             <td>{cb.amount} PI</td>
-            <td>{cb.unlock_time ? new Date(cb.unlock_time).toLocaleString() : 'Claimable now'}</td>
+            <td>{cb.unlock_time ? new Date(cb.unlock_time).toLocaleString() : '—'}</td>
+            <td>
+              {cb.is_claimable_now
+                ? <span className="status-unclaimed">🔓 Unlocked (unclaimed)</span>
+                : <span className="status-locked">🔒 Locked</span>}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -50,6 +60,7 @@ function WalletRow({ wallet, index, onDelete }) {
   const [copyText, setCopyText] = useState('copy address');
 
   const cbCount = (wallet.claimables || []).length;
+  const unclaimedCount = wallet.unlocked_unclaimed_count || 0;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(wallet.public_key).then(() => {
@@ -72,8 +83,11 @@ function WalletRow({ wallet, index, onDelete }) {
     <span className="status-wait">UNFUNDED</span>
   );
 
+  // Determine the wallet's primary unlock status for display
+  const hasUnclaimed = unclaimedCount > 0;
+
   return (
-    <tr>
+    <tr className={hasUnclaimed ? 'row-unclaimed' : ''}>
       <td className="row-num">{index + 1}</td>
       <td>
         <div className="wallet-label">{wallet.phrase_preview || 'unknown'} ...</div>
@@ -83,16 +97,40 @@ function WalletRow({ wallet, index, onDelete }) {
       <td>
         <div className="bal-val">{wallet.available_balance || '0.0000000'} PI</div>
         <div className="bal-sub">
-          claimable {wallet.claimable_total || '0.0000000'} PI ({cbCount})
+          claimable {wallet.claimable_total || '0.0000000'} PI
         </div>
+        {hasUnclaimed && (
+          <div className="unclaimed-badge">
+            🔓 {wallet.unlocked_unclaimed_total} PI unclaimed
+          </div>
+        )}
+      </td>
+      <td>
+        <div className="lockup-info">
+          <span className="lockup-count">{wallet.lockup_count || 0} lockup{(wallet.lockup_count || 0) !== 1 ? 's' : ''}</span>
+        </div>
+        {wallet.earliest_unlock && !hasUnclaimed && (
+          <div className="next-unlock">
+            <span className="next-unlock-label">Next unlock:</span>
+            <br />
+            {formatUnlock(wallet.earliest_unlock, false)}
+          </div>
+        )}
+        {hasUnclaimed && (
+          <div className="next-unlock">
+            {formatUnlock(null, true)}
+          </div>
+        )}
+        {!wallet.earliest_unlock && !hasUnclaimed && (
+          <span className="no-unlock">No pending unlocks</span>
+        )}
         {cbCount > 0 && (
           <button className="expand-btn" onClick={() => setExpanded(!expanded)}>
-            {expanded ? `Hide ${cbCount} ▴` : `Show ${cbCount} ▾`}
+            {expanded ? `Hide details ▴` : `Show ${cbCount} lockup${cbCount !== 1 ? 's' : ''} ▾`}
           </button>
         )}
         {expanded && <ClaimablesTable claimables={wallet.claimables} />}
       </td>
-      <td>{formatUnlock(wallet.earliest_unlock)}</td>
       <td>
         {status}
         <br />
@@ -113,6 +151,8 @@ function Dashboard({ onLogout }) {
     total_available: '0.0000000',
     total_claimable: '0.0000000',
     total_claimable_count: 0,
+    total_unlocked_unclaimed: '0.0000000',
+    total_unlocked_unclaimed_count: 0,
   });
   const [phrases, setPhrases] = useState('');
   const [adding, setAdding] = useState(false);
@@ -185,12 +225,21 @@ function Dashboard({ onLogout }) {
           <div className="stat-value">{parseFloat(stats.total_available).toFixed(4)}</div>
         </div>
         <div className="stat-card">
-          <div className="stat-label">Claimable PI</div>
+          <div className="stat-label">Total Claimable PI</div>
           <div className="stat-value">{parseFloat(stats.total_claimable).toFixed(4)}</div>
         </div>
         <div className="stat-card">
-          <div className="stat-label">Claimable Bals</div>
+          <div className="stat-label">Lockups</div>
           <div className="stat-value">{stats.total_claimable_count}</div>
+        </div>
+        <div className="stat-card stat-card-alert">
+          <div className="stat-label">Unlocked (Unclaimed)</div>
+          <div className="stat-value stat-value-alert">
+            {parseFloat(stats.total_unlocked_unclaimed || 0).toFixed(4)} PI
+          </div>
+          <div className="stat-sub">
+            {stats.total_unlocked_unclaimed_count || 0} balance{(stats.total_unlocked_unclaimed_count || 0) !== 1 ? 's' : ''}
+          </div>
         </div>
       </div>
 
@@ -226,7 +275,7 @@ function Dashboard({ onLogout }) {
                   <th>#</th>
                   <th>Phrase / Address</th>
                   <th>Balance</th>
-                  <th>Unlock Time</th>
+                  <th>Lockups / Unlock</th>
                   <th>Status</th>
                 </tr>
               </thead>
