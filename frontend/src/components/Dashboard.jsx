@@ -144,9 +144,9 @@ function Dashboard({ onLogout }) {
     try {
       const data = await addWallets(phrases);
       if (data.success) {
-        alert(`Added ${data.added} wallet(s)`);
         setPhrases('');
-        refresh();
+        await refresh();
+        alert(`Added ${data.added} wallet(s)`);
       } else {
         alert('Error: ' + data.error);
       }

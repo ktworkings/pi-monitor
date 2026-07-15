@@ -22,7 +22,12 @@ const { Keypair, Server } = require('stellar-sdk');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 const CONFIG = {
   PORT: parseInt(process.env.PORT) || 3010,
@@ -352,7 +357,18 @@ app.get('/api/wallets', authRequired, (req, res) => {
       }
     }
     return {
-      id: w.id, label: w.label, public_key: w.public_key, phrase_preview: w.phrase_preview || getPhrasePreview(w.phrase), created_at: w.created_at,
+      id: w.id,
+      label: w.label,
+      public_key: w.public_key,
+      phrase_preview: w.phrase_preview || getPhrasePreview(w.phrase),
+      created_at: w.created_at,
+      account_exists: false,
+      available_balance: '0.0000000',
+      raw_balance: '0.0000000',
+      claimable_total: '0.0000000',
+      claimables: [],
+      error: null,
+      updated_at: null,
       ...snap,
       earliest_unlock,
     };

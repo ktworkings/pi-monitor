@@ -1,4 +1,6 @@
-const API_BASE = 'https://pi-monitor-ny8e.onrender.com';
+// In development (vite dev server), use relative URLs so the Vite proxy forwards to localhost:3010.
+// In production (built/deployed), use the deployed backend URL.
+const API_BASE = import.meta.env.DEV ? '' : 'https://pi-monitor-ny8e.onrender.com';
 
 export function getToken() {
   return localStorage.getItem('authToken');
