@@ -146,7 +146,13 @@ function Dashboard({ onLogout }) {
       if (data.success) {
         setPhrases('');
         await refresh();
-        alert(`Added ${data.added} wallet(s)`);
+        const failed = data.results ? data.results.filter(r => r.error) : [];
+        let msg = `Added ${data.added} wallet(s)`;
+        if (failed.length > 0) {
+          msg += `\n${failed.length} failed:`;
+          failed.forEach(f => { msg += `\n• ${f.phrase_preview}... — ${f.error}`; });
+        }
+        alert(msg);
       } else {
         alert('Error: ' + data.error);
       }

@@ -18,7 +18,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 const bip39 = require('bip39');
 const hdkey = require('ed25519-hd-key');
-const { Keypair, Server } = require('stellar-sdk');
+const { Keypair, Horizon } = require('stellar-sdk');
+const HorizonServer = Horizon.Server;
 
 const app = express();
 app.use(express.json());
@@ -120,7 +121,7 @@ function emailHtml({ icon, title, accent, rows, footerNote }) {
 
 async function pollWallet(w) {
   if (!w) return;
-  const h = new Server(CONFIG.HORIZON_URL);
+  const h = new HorizonServer(CONFIG.HORIZON_URL);
   const id = w.id;
 
   try {
@@ -310,7 +311,30 @@ app.post('/api/wallets', authRequired, async (req, res) => {
     const { phrases } = req.body || {};
     if (!phrases || !phrases.trim()) return res.status(400).json({ success: false, error: 'phrases required' });
 
-    const phraseList = phrases.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+    // Split on newlines first
+    let phraseList = phrases.split(/\r?\n/).map(p => p.trim()).filter(p => p.length > 0);
+
+    // If a line has more than 24 words, it might contain multiple phrases concatenated.
+    // Split lines with >24 words into chunks of 24 words each.
+    const expanded = [];
+    for (const line of phraseList) {
+      const words = line.split(/\s+/).filter(w => w.length > 0);
+      if (words.length > 24 && words.length % 24 === 0) {
+        // Multiple 24-word phrases on one line
+        for (let i = 0; i < words.length; i += 24) {
+          expanded.push(words.slice(i, i + 24).join(' '));
+        }
+      } else if (words.length > 24 && words.length % 12 === 0 && words.length % 24 !== 0) {
+        // Could be 12-word phrases
+        for (let i = 0; i < words.length; i += 12) {
+          expanded.push(words.slice(i, i + 12).join(' '));
+        }
+      } else {
+        expanded.push(line);
+      }
+    }
+    phraseList = expanded;
+
     if (phraseList.length === 0) return res.status(400).json({ success: false, error: 'no valid phrases' });
 
     const results = [];
