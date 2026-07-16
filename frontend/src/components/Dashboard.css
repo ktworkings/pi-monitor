@@ -428,3 +428,28 @@ td {
 
 .system-status .sys-ok    { color: #4caf50; }
 .system-status .sys-warn  { color: #ff9800; }
+
+
+.system-status .sys-btn {
+  margin-left: auto;
+  background: transparent;
+  color: #00d4ff;
+  border: 1px solid #17324a;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.system-status .sys-btn:hover:not(:disabled) {
+  background: #0e2233;
+  border-color: #00d4ff;
+}
+
+.system-status .sys-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

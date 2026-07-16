@@ -64,3 +64,7 @@ export async function addWallets(phrases) {
 export async function deleteWallet(id) {
   return request(`/api/wallets/${id}`, { method: 'DELETE' });
 }
+
+export async function sendTestEmail() {
+  return request('/api/test-email', { method: 'POST' });
+}

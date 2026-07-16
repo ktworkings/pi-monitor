@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getWallets, addWallets, deleteWallet } from '../api';
+import { getWallets, addWallets, deleteWallet, sendTestEmail } from '../api';
 import './Dashboard.css';
 
 function formatUnlock(isoStr, isClaimableNow) {
@@ -145,11 +145,17 @@ function Dashboard({ onLogout }) {
     in_flight: 0,
     queue_depth: 0,
     stream_active: false,
+    email_configured: false,
+    email_verified: false,
+    email_sent: 0,
+    email_failed: 0,
+    email_last_error: null,
   });
   const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
   const [page, setPage] = useState(1);
   const [phrases, setPhrases] = useState('');
   const [adding, setAdding] = useState(false);
+  const [testingEmail, setTestingEmail] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -179,18 +185,22 @@ function Dashboard({ onLogout }) {
       const data = await addWallets(phrases);
       if (data.success) {
         setPhrases('');
-        if (data.processing) {
-          alert(`${data.queued} phrases queued for processing. They'll appear as they're processed. Total wallets: ${data.total}`);
-        } else {
-          let msg = `Added ${data.added} wallet(s). Total: ${data.total}`;
-          if (data.failed > 0) {
-            msg += `\n${data.failed} failed.`;
-            if (data.errors && data.errors.length > 0) {
-              data.errors.forEach(e => { msg += `\n• ${e.phrase_preview}... — ${e.error}`; });
-            }
-          }
-          alert(msg);
+        const dupExisting = data.duplicates_existing || 0;
+        const dupBatch = data.duplicates_in_batch || 0;
+        const dupTotal = dupExisting + dupBatch;
+        const lines = [];
+        if (data.queued > 0) {
+          lines.push(`${data.queued} unique phrase${data.queued === 1 ? '' : 's'} queued for processing.`);
         }
+        if (dupTotal > 0) {
+          const parts = [];
+          if (dupExisting > 0) parts.push(`${dupExisting} already tracked`);
+          if (dupBatch > 0) parts.push(`${dupBatch} duplicate${dupBatch === 1 ? '' : 's'} in your input`);
+          lines.push(`Skipped ${dupTotal} (${parts.join(', ')}).`);
+        }
+        if (data.message) lines.push(data.message);
+        lines.push(`Total wallets: ${data.total}.`);
+        alert(lines.join('\n'));
         await refresh();
       } else {
         alert('Error: ' + data.error);
@@ -205,6 +215,23 @@ function Dashboard({ onLogout }) {
   const handleDelete = async (id) => {
     await deleteWallet(id);
     refresh();
+  };
+
+  const handleTestEmail = async () => {
+    setTestingEmail(true);
+    try {
+      const data = await sendTestEmail();
+      if (data.success) {
+        alert(`Test email sent to ${data.sent_to}.\nCheck your inbox (and spam) within a minute.`);
+      } else {
+        alert('Test email failed: ' + (data.error || 'unknown error'));
+      }
+    } catch (err) {
+      alert('Test email failed: ' + err.message);
+    } finally {
+      setTestingEmail(false);
+      await refresh();
+    }
   };
 
   const polledPct = stats.total_wallets > 0
@@ -263,6 +290,32 @@ function Dashboard({ onLogout }) {
           <span title="normal">N:{stats.tier_counts?.normal || 0}</span>{' '}
           <span title="idle">I:{stats.tier_counts?.idle || 0}</span>
         </span>
+        <span
+          className={`sys-item ${
+            !stats.email_configured
+              ? 'sys-warn'
+              : stats.email_verified
+                ? 'sys-ok'
+                : 'sys-warn'
+          }`}
+          title={stats.email_last_error || ''}
+        >
+          <b>Email</b>{' '}
+          {!stats.email_configured
+            ? '○ not configured'
+            : stats.email_verified
+              ? `● ${stats.email_sent || 0} sent`
+              : '⚠ unverified'}
+          {stats.email_failed > 0 && ` · ${stats.email_failed} failed`}
+        </span>
+        <button
+          className="sys-btn"
+          onClick={handleTestEmail}
+          disabled={testingEmail || !stats.email_configured}
+          title={!stats.email_configured ? 'Set BREVO_API_KEY, EMAIL_FROM_ADDRESS, EMAIL_TO in .env' : 'Send a test email'}
+        >
+          {testingEmail ? 'Sending…' : 'Send test email'}
+        </button>
       </div>
 
       <div className="card">
