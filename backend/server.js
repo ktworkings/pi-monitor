@@ -186,7 +186,8 @@ function recomputeStats() {
     const cbs = snap.claimables || [];
     claimableCount += cbs.length;
     for (const cb of cbs) {
-      if (cb.is_claimable_now) {
+      // Recompute against wall clock — cached snapshot boolean may be stale.
+      if (isClaimableNow(cb)) {
         unclaimedCount++;
         unclaimedTotal += parseFloat(cb.amount);
       }
@@ -268,6 +269,25 @@ function emailHtml({ icon, title, accent, rows, footerNote }) {
   </table></body></html>`;
 }
 
+// True iff the claimable balance can be claimed right now, based on its unlock_time.
+// Snapshots cache `is_claimable_now` at poll time, but wall-clock has moved on since,
+// so we recompute against Date.now() wherever we consume it.
+function isClaimableNow(cb) {
+  if (!cb) return false;
+  if (!cb.unlock_time) return true;
+  return Date.now() >= new Date(cb.unlock_time).getTime();
+}
+
+// Horizon returns a NotFoundError (404) when an account has never been funded.
+// Every other error (429, 503, 504, network) is transient and MUST NOT zero the snapshot.
+function isNotFound(e) {
+  if (!e) return false;
+  const status = e?.response?.status || e?.status;
+  if (status === 404) return true;
+  if (e.name === 'NotFoundError') return true;
+  return false;
+}
+
 function evaluatePredicate(predicate) {
   if (!predicate) return { unlock_time: null, is_claimable_now: true };
   let lockUntil = null;
@@ -297,10 +317,16 @@ async function pollWallet(w) {
   if (!w) return;
   const h = new HorizonServer(CONFIG.HORIZON_URL);
   const id = w.id;
+  const prev = snapshot[id];
 
+  // ─── Account fetch ─────────────────────────────────────────────
+  // 404 → account genuinely doesn't exist yet, safe to write zeros.
+  // Anything else (429/503/504/network) → keep the prior snapshot intact.
+  let acc;
   try {
-    const acc = await horizonCall(() => h.accounts().accountId(w.public_key).call()).catch(() => null);
-    if (!acc) {
+    acc = await horizonCall(() => h.accounts().accountId(w.public_key).call());
+  } catch (e) {
+    if (isNotFound(e)) {
       snapshot[id] = {
         account_exists: false,
         available_balance: '0.0000000',
@@ -313,13 +339,26 @@ async function pollWallet(w) {
       };
       return;
     }
+    // Transient error — preserve prior data, just tag with error
+    if (prev) {
+      prev.error = e.message;
+      prev.updated_at = new Date().toISOString();
+    }
+    return;
+  }
 
-    const rawBal = acc.balances.find(b => b.asset_type === 'native')?.balance || '0';
-    const availBal = Math.max(0, parseFloat(rawBal) - CONFIG.RESERVE_PI);
-    const cbs = await horizonCall(() => h.claimableBalances().claimant(w.public_key).limit(200).call()).catch(() => ({ records: [] }));
-    let claimableTotal = 0;
-    const claimables = [];
+  const rawBal = acc.balances.find(b => b.asset_type === 'native')?.balance || '0';
+  const availBal = Math.max(0, parseFloat(rawBal) - CONFIG.RESERVE_PI);
 
+  // ─── Claimable balances fetch ──────────────────────────────────
+  // Soft-fail: on transient error, keep the previous claimables list
+  // (with is_claimable_now refreshed against wall clock) rather than blanking it.
+  let claimables;
+  let claimableTotal;
+  try {
+    const cbs = await horizonCall(() => h.claimableBalances().claimant(w.public_key).limit(200).call());
+    claimables = [];
+    claimableTotal = 0;
     for (const cb of cbs.records) {
       claimableTotal += parseFloat(cb.amount);
       const claimant = cb.claimants.find(c => c.destination === w.public_key);
@@ -327,21 +366,26 @@ async function pollWallet(w) {
       const { unlock_time, is_claimable_now } = evaluatePredicate(pred);
       claimables.push({ id: cb.id, amount: cb.amount, unlock_time, is_claimable_now });
     }
+  } catch (e) {
+    claimables = (prev?.claimables || []).map(cb => ({ ...cb, is_claimable_now: isClaimableNow(cb) }));
+    claimableTotal = claimables.reduce((s, cb) => s + parseFloat(cb.amount), 0);
+  }
 
-    snapshot[id] = {
-      account_exists: true,
-      available_balance: availBal.toFixed(7),
-      raw_balance: parseFloat(rawBal).toFixed(7),
-      claimable_total: claimableTotal.toFixed(7),
-      claimables,
-      lockup_count: claimables.length,
-      updated_at: new Date().toISOString(),
-      error: null,
-    };
+  snapshot[id] = {
+    account_exists: true,
+    available_balance: availBal.toFixed(7),
+    raw_balance: parseFloat(rawBal).toFixed(7),
+    claimable_total: claimableTotal.toFixed(7),
+    claimables,
+    lockup_count: claimables.length,
+    updated_at: new Date().toISOString(),
+    error: null,
+  };
 
-    // Unlocked-but-unclaimed alerts (fire once per claimable id)
+  // ─── Alerts (isolated so an email failure can't corrupt the snapshot) ─
+  try {
     const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
-    const unlockedUnclaimed = claimables.filter(cb => cb.is_claimable_now);
+    const unlockedUnclaimed = claimables.filter(cb => isClaimableNow(cb));
     for (const uc of unlockedUnclaimed) {
       const notifKey = `${w.id}:${uc.id}`;
       if (!unclaimedNotified.has(notifKey)) {
@@ -438,12 +482,9 @@ async function pollWallet(w) {
       }
     }
   } catch (e) {
-    if (!snapshot[id] || !snapshot[id].account_exists) {
-      snapshot[id] = { error: e.message, account_exists: false, updated_at: new Date().toISOString() };
-    } else {
-      snapshot[id].error = e.message;
-      snapshot[id].updated_at = new Date().toISOString();
-    }
+    // Alerts pipeline failed (email send, iteration bug, etc). Snapshot is already
+    // written above with correct balance/claimables data — do NOT overwrite it here.
+    console.error(`[poll] alerts pipeline failed for ${w.label}: ${e.message}`);
   }
 }
 
@@ -686,7 +727,9 @@ app.get('/api/wallets', authRequired, (req, res) => {
   const allWallets = Array.from(wallets.values());
   const enriched = allWallets.map(w => {
     const snap = snapshot[w.id] || {};
-    const claimables = snap.claimables || [];
+    // Refresh is_claimable_now against wall clock so the dashboard reflects reality
+    // even when the underlying snapshot was written minutes/hours ago.
+    const claimables = (snap.claimables || []).map(cb => ({ ...cb, is_claimable_now: isClaimableNow(cb) }));
 
     let earliest_unlock = null;
     const lockedItems = claimables.filter(cb => !cb.is_claimable_now && cb.unlock_time);
