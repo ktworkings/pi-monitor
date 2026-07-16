@@ -388,55 +388,69 @@ app.post('/api/wallets', authRequired, (req, res) => {
     const { phrases } = req.body || {};
     if (!phrases || !phrases.trim()) return res.status(400).json({ success: false, error: 'phrases required' });
 
-    let phraseList = phrases.split(/\r?\n/).map(p => p.trim()).filter(p => p.length > 0);
+    // Split on newlines, commas, semicolons, or any common delimiter
+    let rawLines = phrases.split(/[\r\n;,]+/).map(p => p.trim()).filter(p => p.length > 0);
 
-    // Auto-split lines with multiple concatenated phrases
-    const expanded = [];
-    for (const line of phraseList) {
+    // For each line, if it has more than 24 words, split into 24-word chunks
+    const phraseList = [];
+    for (const line of rawLines) {
       const words = line.split(/\s+/).filter(w => w.length > 0);
-      if (words.length > 24 && words.length % 24 === 0) {
-        for (let i = 0; i < words.length; i += 24) expanded.push(words.slice(i, i + 24).join(' '));
-      } else if (words.length > 24 && words.length % 12 === 0 && words.length % 24 !== 0) {
-        for (let i = 0; i < words.length; i += 12) expanded.push(words.slice(i, i + 12).join(' '));
+      if (words.length <= 24) {
+        phraseList.push(line);
       } else {
-        expanded.push(line);
+        for (let i = 0; i < words.length; i += 24) {
+          const chunk = words.slice(i, i + 24).join(' ');
+          if (chunk.split(/\s+/).length >= 12) {
+            phraseList.push(chunk);
+          }
+        }
       }
     }
-    phraseList = expanded;
 
     if (phraseList.length === 0) return res.status(400).json({ success: false, error: 'no valid phrases' });
 
-    // Process in sync — deriveKeypair is CPU-bound but fast per phrase
-    let added = 0, failed = 0;
-    const errors = [];
-    for (const phrase of phraseList) {
-      try {
-        const kp = deriveKeypair(phrase);
-        const id = crypto.randomUUID();
-        const w = {
-          id,
-          label: kp.publicKey().slice(0, 8),
-          phrase: phrase.trim(),
-          phrase_preview: getPhrasePreview(phrase),
-          public_key: kp.publicKey(),
-          created_at: new Date().toISOString(),
-          last_payment_cursor: null
-        };
-        wallets.set(id, w);
-        added++;
-      } catch (e) {
-        failed++;
-        if (errors.length < 10) errors.push({ phrase_preview: getPhrasePreview(phrase), error: e.message });
+    const totalPhrases = phraseList.length;
+    console.log(`[wallets] Queued ${totalPhrases} phrases for background processing...`);
+
+    // Respond immediately — processing happens in background
+    res.json({ success: true, added: 0, queued: totalPhrases, total: wallets.size + totalPhrases, processing: true });
+
+    // Process derivations in background chunks to avoid blocking event loop
+    let idx = 0;
+    const CHUNK_SIZE = 50;
+
+    function processChunk() {
+      const end = Math.min(idx + CHUNK_SIZE, phraseList.length);
+      for (let i = idx; i < end; i++) {
+        try {
+          const phrase = phraseList[i];
+          const kp = deriveKeypair(phrase);
+          const id = crypto.randomUUID();
+          wallets.set(id, {
+            id,
+            label: kp.publicKey().slice(0, 8),
+            phrase: phrase.trim(),
+            phrase_preview: getPhrasePreview(phrase),
+            public_key: kp.publicKey(),
+            created_at: new Date().toISOString(),
+            last_payment_cursor: null
+          });
+        } catch (e) {
+          // Skip invalid phrases silently
+        }
+      }
+      idx = end;
+      cachedStats.total_wallets = wallets.size;
+
+      if (idx < phraseList.length) {
+        setImmediate(processChunk);
+      } else {
+        console.log(`[wallets] Background processing complete. Total wallets: ${wallets.size}`);
+        if (!isPolling) pollAllWallets();
       }
     }
 
-    // Update stats count immediately
-    cachedStats.total_wallets = wallets.size;
-
-    // Trigger a poll cycle in the background (don't await)
-    if (!isPolling) pollAllWallets();
-
-    res.json({ success: true, added, failed, errors, total: wallets.size });
+    setImmediate(processChunk);
   } catch (e) {
     res.status(400).json({ success: false, error: e.message });
   }

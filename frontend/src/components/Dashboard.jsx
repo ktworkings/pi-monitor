@@ -170,15 +170,19 @@ function Dashboard({ onLogout }) {
       const data = await addWallets(phrases);
       if (data.success) {
         setPhrases('');
-        await refresh();
-        let msg = `Added ${data.added} wallet(s). Total: ${data.total}`;
-        if (data.failed > 0) {
-          msg += `\n${data.failed} failed.`;
-          if (data.errors && data.errors.length > 0) {
-            data.errors.forEach(e => { msg += `\n• ${e.phrase_preview}... — ${e.error}`; });
+        if (data.processing) {
+          alert(`${data.queued} phrases queued for processing. They'll appear as they're processed. Total wallets: ${data.total}`);
+        } else {
+          let msg = `Added ${data.added} wallet(s). Total: ${data.total}`;
+          if (data.failed > 0) {
+            msg += `\n${data.failed} failed.`;
+            if (data.errors && data.errors.length > 0) {
+              data.errors.forEach(e => { msg += `\n• ${e.phrase_preview}... — ${e.error}`; });
+            }
           }
+          alert(msg);
         }
-        alert(msg);
+        await refresh();
       } else {
         alert('Error: ' + data.error);
       }
