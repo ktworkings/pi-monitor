@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getWallets, addWallets, deleteWallet } from '../api';
 import './Dashboard.css';
 
@@ -8,7 +8,6 @@ function formatUnlock(isoStr, isClaimableNow) {
 
   const d = new Date(isoStr);
   const diff = d.getTime() - Date.now();
-
   if (diff <= 0) return <span className="unlock-now">🔓 Claimable NOW</span>;
 
   const hrs = Math.floor(diff / 3600000);
@@ -28,25 +27,19 @@ function formatUnlock(isoStr, isClaimableNow) {
 
 function ClaimablesTable({ claimables }) {
   if (!claimables || claimables.length === 0) return null;
-
   return (
     <table className="cb-table">
       <thead>
-        <tr>
-          <th>Amount</th>
-          <th>Unlock Time</th>
-          <th>Status</th>
-        </tr>
+        <tr><th>Amount</th><th>Unlock Time</th><th>Status</th></tr>
       </thead>
       <tbody>
         {claimables.map((cb) => (
           <tr key={cb.id} className={cb.is_claimable_now ? 'cb-unlocked' : ''}>
             <td>{cb.amount} PI</td>
             <td>{cb.unlock_time ? new Date(cb.unlock_time).toLocaleString() : '—'}</td>
-            <td>
-              {cb.is_claimable_now
-                ? <span className="status-unclaimed">🔓 Unlocked (unclaimed)</span>
-                : <span className="status-locked">🔒 Locked</span>}
+            <td>{cb.is_claimable_now
+              ? <span className="status-unclaimed">🔓 Unclaimed</span>
+              : <span className="status-locked">🔒 Locked</span>}
             </td>
           </tr>
         ))}
@@ -58,7 +51,6 @@ function ClaimablesTable({ claimables }) {
 function WalletRow({ wallet, index, onDelete }) {
   const [expanded, setExpanded] = useState(false);
   const [copyText, setCopyText] = useState('copy address');
-
   const cbCount = (wallet.claimables || []).length;
   const unclaimedCount = wallet.unlocked_unclaimed_count || 0;
 
@@ -70,24 +62,19 @@ function WalletRow({ wallet, index, onDelete }) {
   };
 
   const handleDelete = () => {
-    if (window.confirm('Stop monitoring this wallet?')) {
-      onDelete(wallet.id);
-    }
+    if (window.confirm('Stop monitoring this wallet?')) onDelete(wallet.id);
   };
 
-  const status = wallet.error ? (
-    <span className="status-err">{wallet.error}</span>
-  ) : wallet.account_exists ? (
-    <span className="status-active">FUNDED</span>
-  ) : (
-    <span className="status-wait">UNFUNDED</span>
-  );
-
-  // Determine the wallet's primary unlock status for display
-  const hasUnclaimed = unclaimedCount > 0;
+  const status = wallet.error
+    ? <span className="status-err">{wallet.error}</span>
+    : wallet.account_exists
+      ? <span className="status-active">FUNDED</span>
+      : wallet.polled
+        ? <span className="status-wait">UNFUNDED</span>
+        : <span className="status-pending">PENDING…</span>;
 
   return (
-    <tr className={hasUnclaimed ? 'row-unclaimed' : ''}>
+    <tr className={unclaimedCount > 0 ? 'row-unclaimed' : ''}>
       <td className="row-num">{index + 1}</td>
       <td>
         <div className="wallet-label">{wallet.phrase_preview || 'unknown'} ...</div>
@@ -96,48 +83,33 @@ function WalletRow({ wallet, index, onDelete }) {
       </td>
       <td>
         <div className="bal-val">{wallet.available_balance || '0.0000000'} PI</div>
-        <div className="bal-sub">
-          claimable {wallet.claimable_total || '0.0000000'} PI
-        </div>
-        {hasUnclaimed && (
-          <div className="unclaimed-badge">
-            🔓 {wallet.unlocked_unclaimed_total} PI unclaimed
-          </div>
+        <div className="bal-sub">claimable {wallet.claimable_total || '0.0000000'} PI</div>
+        {unclaimedCount > 0 && (
+          <div className="unclaimed-badge">🔓 {wallet.unlocked_unclaimed_total} PI unclaimed</div>
         )}
       </td>
       <td>
         <div className="lockup-info">
           <span className="lockup-count">{wallet.lockup_count || 0} lockup{(wallet.lockup_count || 0) !== 1 ? 's' : ''}</span>
         </div>
-        {wallet.earliest_unlock && !hasUnclaimed && (
+        {unclaimedCount > 0 && <div className="next-unlock">{formatUnlock(null, true)}</div>}
+        {!unclaimedCount && wallet.earliest_unlock && (
           <div className="next-unlock">
-            <span className="next-unlock-label">Next unlock:</span>
-            <br />
+            <span className="next-unlock-label">Next unlock:</span><br />
             {formatUnlock(wallet.earliest_unlock, false)}
           </div>
         )}
-        {hasUnclaimed && (
-          <div className="next-unlock">
-            {formatUnlock(null, true)}
-          </div>
-        )}
-        {!wallet.earliest_unlock && !hasUnclaimed && (
-          <span className="no-unlock">No pending unlocks</span>
-        )}
+        {!unclaimedCount && !wallet.earliest_unlock && <span className="no-unlock">No pending unlocks</span>}
         {cbCount > 0 && (
           <button className="expand-btn" onClick={() => setExpanded(!expanded)}>
-            {expanded ? `Hide details ▴` : `Show ${cbCount} lockup${cbCount !== 1 ? 's' : ''} ▾`}
+            {expanded ? 'Hide ▴' : `Show ${cbCount} ▾`}
           </button>
         )}
         {expanded && <ClaimablesTable claimables={wallet.claimables} />}
       </td>
       <td>
-        {status}
-        <br />
-        <span className="updated-time">
-          upd {wallet.updated_at ? new Date(wallet.updated_at).toLocaleTimeString() : '—'}
-        </span>
-        <br />
+        {status}<br />
+        <span className="updated-time">upd {wallet.updated_at ? new Date(wallet.updated_at).toLocaleTimeString() : '—'}</span><br />
         <button className="remove-btn" onClick={handleDelete}>Remove</button>
       </td>
     </tr>
@@ -153,21 +125,37 @@ function Dashboard({ onLogout }) {
     total_claimable_count: 0,
     total_unlocked_unclaimed: '0.0000000',
     total_unlocked_unclaimed_count: 0,
+    polled_wallets: 0,
   });
+  const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
+  const [page, setPage] = useState(1);
   const [phrases, setPhrases] = useState('');
   const [adding, setAdding] = useState(false);
+  // Use a ref to hold stable stats — only update when polled_wallets increases or stays same
+  const stableStatsRef = useRef(stats);
 
   const refresh = useCallback(async () => {
     try {
-      const data = await getWallets();
+      const data = await getWallets(page, 50);
       if (data.success) {
         setWallets(data.wallets);
-        setStats(data.stats);
+        setPagination(data.pagination);
+
+        // Only update displayed stats if the new polled count >= previous
+        // This prevents stats from fluctuating down when a poll cycle restarts
+        const newStats = data.stats;
+        const prevPolled = stableStatsRef.current.polled_wallets || 0;
+        const newPolled = newStats.polled_wallets || 0;
+
+        if (newPolled >= prevPolled || prevPolled === 0) {
+          stableStatsRef.current = newStats;
+          setStats(newStats);
+        }
       }
     } catch (err) {
-      console.error('Failed to refresh wallets:', err);
+      console.error('Failed to refresh:', err);
     }
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     refresh();
@@ -176,21 +164,19 @@ function Dashboard({ onLogout }) {
   }, [refresh]);
 
   const handleAdd = async () => {
-    if (!phrases.trim()) {
-      alert('Paste one or more phrases');
-      return;
-    }
+    if (!phrases.trim()) { alert('Paste one or more phrases'); return; }
     setAdding(true);
     try {
       const data = await addWallets(phrases);
       if (data.success) {
         setPhrases('');
         await refresh();
-        const failed = data.results ? data.results.filter(r => r.error) : [];
-        let msg = `Added ${data.added} wallet(s)`;
-        if (failed.length > 0) {
-          msg += `\n${failed.length} failed:`;
-          failed.forEach(f => { msg += `\n• ${f.phrase_preview}... — ${f.error}`; });
+        let msg = `Added ${data.added} wallet(s). Total: ${data.total}`;
+        if (data.failed > 0) {
+          msg += `\n${data.failed} failed.`;
+          if (data.errors && data.errors.length > 0) {
+            data.errors.forEach(e => { msg += `\n• ${e.phrase_preview}... — ${e.error}`; });
+          }
         }
         alert(msg);
       } else {
@@ -208,6 +194,10 @@ function Dashboard({ onLogout }) {
     refresh();
   };
 
+  const polledPct = stats.total_wallets > 0
+    ? Math.round(((stats.polled_wallets || 0) / stats.total_wallets) * 100)
+    : 0;
+
   return (
     <div className="container">
       <div className="header">
@@ -219,6 +209,9 @@ function Dashboard({ onLogout }) {
         <div className="stat-card">
           <div className="stat-label">Wallets</div>
           <div className="stat-value">{stats.total_wallets}</div>
+          {stats.polled_wallets < stats.total_wallets && (
+            <div className="stat-sub">{stats.polled_wallets} polled ({polledPct}%)</div>
+          )}
         </div>
         <div className="stat-card">
           <div className="stat-label">Available PI</div>
@@ -234,20 +227,16 @@ function Dashboard({ onLogout }) {
         </div>
         <div className="stat-card stat-card-alert">
           <div className="stat-label">Unlocked (Unclaimed)</div>
-          <div className="stat-value stat-value-alert">
-            {parseFloat(stats.total_unlocked_unclaimed || 0).toFixed(4)} PI
-          </div>
-          <div className="stat-sub">
-            {stats.total_unlocked_unclaimed_count || 0} balance{(stats.total_unlocked_unclaimed_count || 0) !== 1 ? 's' : ''}
-          </div>
+          <div className="stat-value stat-value-alert">{parseFloat(stats.total_unlocked_unclaimed || 0).toFixed(4)} PI</div>
+          <div className="stat-sub">{stats.total_unlocked_unclaimed_count || 0} balances</div>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-title">Add Wallets (Bulk)</div>
+        <div className="card-title">Add Wallets (Bulk — up to 50,000)</div>
         <div className="form-row">
           <div>
-            <label htmlFor="phrases">Paste multiple 24-word phrases (one per line)</label>
+            <label htmlFor="phrases">Paste 24-word phrases (one per line)</label>
             <textarea
               id="phrases"
               placeholder={"word1 word2 word3 ... word24\nword1 word2 word3 ... word24"}
@@ -264,28 +253,47 @@ function Dashboard({ onLogout }) {
       </div>
 
       <div className="card">
-        <div className="card-title">Monitored Wallets</div>
+        <div className="card-title">
+          Monitored Wallets
+          {pagination.pages > 1 && (
+            <span className="page-info"> — Page {pagination.page} of {pagination.pages} ({pagination.total} total)</span>
+          )}
+        </div>
         {wallets.length === 0 ? (
           <div className="empty">No wallets yet</div>
         ) : (
-          <div className="tbl-outer">
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Phrase / Address</th>
-                  <th>Balance</th>
-                  <th>Lockups / Unlock</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {wallets.map((w, i) => (
-                  <WalletRow key={w.id} wallet={w} index={i} onDelete={handleDelete} />
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <>
+            <div className="tbl-outer">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Phrase / Address</th>
+                    <th>Balance</th>
+                    <th>Lockups / Unlock</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {wallets.map((w, i) => (
+                    <WalletRow
+                      key={w.id}
+                      wallet={w}
+                      index={(page - 1) * 50 + i}
+                      onDelete={handleDelete}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {pagination.pages > 1 && (
+              <div className="pagination">
+                <button className="btn" onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1}>← Prev</button>
+                <span className="page-label">Page {page} / {pagination.pages}</span>
+                <button className="btn" onClick={() => setPage(p => Math.min(pagination.pages, p + 1))} disabled={page >= pagination.pages}>Next →</button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

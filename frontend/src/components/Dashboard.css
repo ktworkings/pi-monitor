@@ -367,3 +367,30 @@ td {
   font-size: 10px;
   color: #556;
 }
+
+.status-pending {
+  color: #556;
+  font-weight: 600;
+  font-style: italic;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(0, 212, 255, 0.1);
+}
+
+.page-label {
+  color: #b8c9d9;
+  font-size: 13px;
+}
+
+.page-info {
+  font-size: 12px;
+  color: #778;
+  font-weight: 400;
+}
