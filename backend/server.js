@@ -2,8 +2,8 @@
  * Pi/Stellar Wallet Monitor — Backend API
  * ---------------------------------------------------------------
  * - Add wallets by pasting phrases (one per line, bulk add supported)
- * - Supports up to 50,000 wallets in-memory
- * - Polls Horizon in controlled batches for balances and claimable balances
+ * - Adaptive scheduler + worker pool with rate-limit-aware backoff
+ * - Optional Horizon SSE payment stream for near-real-time alerts
  * - Email alerts via Brevo SMTP on: new claimable balance,
  *   ~24h/~2h before unlock, payment in/out, and unlocked-but-unclaimed
  * - Read-only, never builds or submits transactions
@@ -22,7 +22,7 @@ const { Keypair, Horizon } = require('stellar-sdk');
 const HorizonServer = Horizon.Server;
 
 const app = express();
-// Increase payload limit for bulk wallet additions (50k phrases ~= 50MB)
+// Bulk adds can be large (50k phrases ~= tens of MB of body)
 app.use(express.json({ limit: '100mb' }));
 app.use(cors({
   origin: true,
@@ -34,9 +34,21 @@ app.use(cors({
 const CONFIG = {
   PORT: parseInt(process.env.PORT) || 3010,
   HORIZON_URL: process.env.HORIZON_URL || 'https://api.mainnet.minepi.com',
-  POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS) || 30000,
   RESERVE_PI: parseInt(process.env.RESERVE_PI) || 1,
-  POLL_BATCH_SIZE: parseInt(process.env.POLL_BATCH_SIZE) || 10,
+
+  // Adaptive scheduler — per-wallet poll cadence by urgency tier
+  POLL_URGENT_MS: parseInt(process.env.POLL_URGENT_MS) || 60000,     // 1 min  — unclaimed / <2h to unlock / first poll
+  POLL_SOON_MS:   parseInt(process.env.POLL_SOON_MS)   || 300000,    // 5 min  — <24h to unlock / errored
+  POLL_NORMAL_MS: parseInt(process.env.POLL_NORMAL_MS) || 1800000,   // 30 min — funded, no imminent events
+  POLL_IDLE_MS:   parseInt(process.env.POLL_IDLE_MS)   || 7200000,   // 2 hr   — empty accounts
+
+  // Worker pool + rate limiter
+  MAX_CONCURRENCY: parseInt(process.env.MAX_CONCURRENCY) || 25,
+  MAX_RPS: parseInt(process.env.MAX_RPS) || 50,
+
+  // Horizon SSE payment stream (near-real-time payment alerts)
+  ENABLE_PAYMENT_STREAM: (process.env.ENABLE_PAYMENT_STREAM || 'true').toLowerCase() !== 'false',
+
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',
   EMAIL_FROM_NAME: process.env.EMAIL_FROM_NAME || 'Pi Wallet Monitor',
   EMAIL_FROM_ADDRESS: process.env.EMAIL_FROM_ADDRESS || '',
@@ -48,12 +60,9 @@ const CONFIG = {
 const PI_DERIVATION_PATH = "m/44'/314159'/0'";
 const REMINDER_24H_MS = 24 * 60 * 60 * 1000;
 const REMINDER_2H_MS = 2 * 60 * 60 * 1000;
-const REMINDER_WINDOW_MS = 5 * 60 * 1000;
 
 let mailerReady = !!(CONFIG.BREVO_API_KEY && CONFIG.EMAIL_FROM_ADDRESS && CONFIG.EMAIL_TO);
-if (!mailerReady) {
-  console.warn('[email] Brevo not configured — alerts disabled');
-}
+if (!mailerReady) console.warn('[email] Brevo not configured — alerts disabled');
 
 const wallets = new Map();
 const snapshot = {};
@@ -62,7 +71,78 @@ const seenPayments = new Set();
 const sessions = new Map();
 const unclaimedNotified = new Set();
 
-// Cached stats — updated incrementally as wallets are polled
+// ═══════════════════════════ RATE LIMITER ═══════════════════════════
+// Token-bucket with 429-triggered adaptive backoff. Every Horizon call
+// acquires one token; on throttling we halve rps and back off exponentially,
+// then recover slowly on sustained success.
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const rateState = {
+  rps: CONFIG.MAX_RPS,
+  targetRps: CONFIG.MAX_RPS,
+  tokens: CONFIG.MAX_RPS,
+  lastRefill: Date.now(),
+  backoffUntil: 0,
+  consecutive429s: 0,
+  consecutiveOK: 0,
+};
+
+function refillTokens() {
+  const now = Date.now();
+  const dt = (now - rateState.lastRefill) / 1000;
+  rateState.tokens = Math.min(rateState.rps, rateState.tokens + dt * rateState.rps);
+  rateState.lastRefill = now;
+}
+
+async function acquireToken() {
+  while (true) {
+    const now = Date.now();
+    if (now < rateState.backoffUntil) {
+      await sleep(Math.min(500, rateState.backoffUntil - now));
+      continue;
+    }
+    refillTokens();
+    if (rateState.tokens >= 1) {
+      rateState.tokens -= 1;
+      return;
+    }
+    await sleep(20);
+  }
+}
+
+function onRateLimited() {
+  rateState.consecutive429s++;
+  rateState.consecutiveOK = 0;
+  const backoffMs = Math.min(60000, 500 * Math.pow(2, rateState.consecutive429s));
+  rateState.backoffUntil = Date.now() + backoffMs;
+  rateState.rps = Math.max(2, rateState.rps * 0.5);
+  console.warn(`[ratelimit] throttled: backoff=${backoffMs}ms new_rps=${rateState.rps.toFixed(1)}`);
+}
+
+function onCallSuccess() {
+  rateState.consecutiveOK++;
+  if (rateState.consecutive429s > 0 && rateState.consecutiveOK > 50) rateState.consecutive429s = 0;
+  if (rateState.rps < rateState.targetRps && rateState.consecutiveOK % 20 === 0) {
+    rateState.rps = Math.min(rateState.targetRps, rateState.rps * 1.1);
+  }
+}
+
+async function horizonCall(fn) {
+  await acquireToken();
+  try {
+    const r = await fn();
+    onCallSuccess();
+    return r;
+  } catch (e) {
+    const status = e?.response?.status || e?.status;
+    if (status === 429 || status === 503 || status === 504) onRateLimited();
+    throw e;
+  }
+}
+
+// ═══════════════════════════ STATS ═══════════════════════════
+
 let cachedStats = {
   total_wallets: 0,
   total_available: '0.0000000',
@@ -72,18 +152,35 @@ let cachedStats = {
   total_unlocked_unclaimed_count: 0,
   polled_wallets: 0,
   last_full_update: null,
+  tier_counts: { urgent: 0, soon: 0, normal: 0, idle: 0 },
+  poll_lag_avg_ms: 0,
+  poll_lag_max_ms: 0,
+  rate_limit_rps: CONFIG.MAX_RPS,
+  rate_limit_active: false,
+  in_flight: 0,
+  queue_depth: 0,
+  stream_active: false,
+  stream_last_event_ago_ms: null,
 };
 
-// Full recompute — called after complete poll cycles or on-demand
 function recomputeStats() {
   let available = 0, claimable = 0, claimableCount = 0;
   let unclaimedCount = 0, unclaimedTotal = 0;
   let polled = 0;
+  const tiers = { urgent: 0, soon: 0, normal: 0, idle: 0 };
+  let lagSum = 0, lagCount = 0, lagMax = 0;
+  const now = Date.now();
 
   for (const w of wallets.values()) {
+    const tier = w.tier || 'urgent';
+    tiers[tier] = (tiers[tier] || 0) + 1;
     const snap = snapshot[w.id];
     if (!snap || !snap.updated_at) continue;
     polled++;
+    const lag = now - new Date(snap.updated_at).getTime();
+    lagSum += lag;
+    lagCount++;
+    if (lag > lagMax) lagMax = lag;
     available += parseFloat(snap.available_balance || 0);
     claimable += parseFloat(snap.claimable_total || 0);
     const cbs = snap.claimables || [];
@@ -105,10 +202,20 @@ function recomputeStats() {
     total_unlocked_unclaimed_count: unclaimedCount,
     polled_wallets: polled,
     last_full_update: new Date().toISOString(),
+    tier_counts: tiers,
+    poll_lag_avg_ms: lagCount ? Math.round(lagSum / lagCount) : 0,
+    poll_lag_max_ms: lagMax,
+    rate_limit_rps: parseFloat(rateState.rps.toFixed(1)),
+    rate_limit_active: rateState.backoffUntil > now,
+    in_flight: inFlight.size,
+    queue_depth: workQueue.length,
+    stream_active: streamState.active,
+    stream_last_event_ago_ms: streamState.lastEventAt ? now - streamState.lastEventAt : null,
   };
-  
   return cachedStats;
 }
+
+// ═══════════════════════════ CORE HELPERS ═══════════════════════════
 
 function deriveKeypair(phrase) {
   const seed = bip39.mnemonicToSeedSync(phrase);
@@ -184,13 +291,15 @@ function evaluatePredicate(predicate) {
   return { unlock_time, is_claimable_now };
 }
 
+// ═══════════════════════════ POLL A SINGLE WALLET ═══════════════════════════
+
 async function pollWallet(w) {
   if (!w) return;
   const h = new HorizonServer(CONFIG.HORIZON_URL);
   const id = w.id;
 
   try {
-    const acc = await h.accounts().accountId(w.public_key).call().catch(() => null);
+    const acc = await horizonCall(() => h.accounts().accountId(w.public_key).call()).catch(() => null);
     if (!acc) {
       snapshot[id] = {
         account_exists: false,
@@ -200,14 +309,14 @@ async function pollWallet(w) {
         claimables: [],
         lockup_count: 0,
         updated_at: new Date().toISOString(),
-        error: null
+        error: null,
       };
       return;
     }
 
     const rawBal = acc.balances.find(b => b.asset_type === 'native')?.balance || '0';
     const availBal = Math.max(0, parseFloat(rawBal) - CONFIG.RESERVE_PI);
-    const cbs = await h.claimableBalances().claimant(w.public_key).call().catch(() => ({ records: [] }));
+    const cbs = await horizonCall(() => h.claimableBalances().claimant(w.public_key).limit(200).call()).catch(() => ({ records: [] }));
     let claimableTotal = 0;
     const claimables = [];
 
@@ -227,10 +336,10 @@ async function pollWallet(w) {
       claimables,
       lockup_count: claimables.length,
       updated_at: new Date().toISOString(),
-      error: null
+      error: null,
     };
 
-    // Unlocked-but-unclaimed alerts
+    // Unlocked-but-unclaimed alerts (fire once per claimable id)
     const phrasePreview = w.phrase_preview || getPhrasePreview(w.phrase);
     const unlockedUnclaimed = claimables.filter(cb => cb.is_claimable_now);
     for (const uc of unlockedUnclaimed) {
@@ -253,11 +362,11 @@ async function pollWallet(w) {
       }
     }
 
-    // Payment tracking
-    let isFirstPoll = !w.last_payment_cursor;
-    const payments = await h.payments().forAccount(w.public_key).order('desc').limit(10).call().catch(() => ({ records: [] }));
+    // Payment tracking — skip historical on first observation
+    const isFirstPoll = !w.last_payment_cursor;
+    const payments = await horizonCall(() => h.payments().forAccount(w.public_key).order('desc').limit(50).call()).catch(() => ({ records: [] }));
     for (const p of payments.records) {
-      if (w.last_payment_cursor && seenPayments.has(p.id)) continue;
+      if (seenPayments.has(p.id)) continue;
       seenPayments.add(p.id);
       if (isFirstPoll) continue;
       const direction = p.to === w.public_key ? 'IN' : (p.from === w.public_key ? 'OUT' : '?');
@@ -282,7 +391,7 @@ async function pollWallet(w) {
     if (payments.records.length) w.last_payment_cursor = payments.records[0].paging_token;
     else if (isFirstPoll) w.last_payment_cursor = 'checked';
 
-    // Unlock reminders (24h, 2h)
+    // Unlock reminders — open-ended thresholds (no narrow fire window)
     for (const cb of claimables) {
       if (cb.is_claimable_now) continue;
       let tracked = claimableTracked.get(cb.id);
@@ -306,7 +415,8 @@ async function pollWallet(w) {
       }
       if (cb.unlock_time) {
         const msLeft = new Date(cb.unlock_time).getTime() - Date.now();
-        if (!tracked.notified_24h && msLeft <= REMINDER_24H_MS && msLeft > REMINDER_24H_MS - REMINDER_WINDOW_MS) {
+        // 24h reminder — fires on any observation inside (2h, 24h]
+        if (!tracked.notified_24h && msLeft <= REMINDER_24H_MS && msLeft > REMINDER_2H_MS) {
           tracked.notified_24h = true;
           await sendEmail(`🟡 Unlocks in ~24h — ${phrasePreview}`, `Amount: ${cb.amount} PI`,
             emailHtml({ icon: '🟡', title: 'Unlocks in ~24 Hours', accent: '#ffc107', rows: [
@@ -315,7 +425,8 @@ async function pollWallet(w) {
               { label: 'Unlock', value: new Date(cb.unlock_time).toLocaleString() },
             ]}));
         }
-        if (!tracked.notified_2h && msLeft <= REMINDER_2H_MS && msLeft > REMINDER_2H_MS - REMINDER_WINDOW_MS) {
+        // 2h reminder — fires on any observation inside (0, 2h]
+        if (!tracked.notified_2h && msLeft <= REMINDER_2H_MS && msLeft > 0) {
           tracked.notified_2h = true;
           await sendEmail(`🟠 Unlocks in ~2h — ${phrasePreview}`, `Amount: ${cb.amount} PI`,
             emailHtml({ icon: '🟠', title: 'Unlocks in ~2 Hours', accent: '#ff9800', rows: [
@@ -336,44 +447,157 @@ async function pollWallet(w) {
   }
 }
 
-// ═══════════════════════════ BATCHED POLLING ═══════════════════════════
-// Poll wallets in batches to avoid overwhelming Horizon API
-let isPolling = false;
-let pollProgress = { current: 0, total: 0 };
+// ═══════════════════════════ ADAPTIVE SCHEDULER + WORKER POOL ═══════════════════════════
+// A tick loop scans wallets every 250ms and enqueues those whose `next_poll_at` has passed.
+// A pool of N workers drains the queue concurrently. Global throttling lives in the rate
+// limiter, so worker count is just the concurrency ceiling.
 
-async function pollAllWallets() {
-  if (isPolling) return;
-  isPolling = true;
+const workQueue = [];
+const scheduledSet = new Set(); // dedup — id present iff in workQueue
+const inFlight = new Set();
+let schedulerRunning = false;
 
-  const allWallets = Array.from(wallets.values());
-  const batchSize = CONFIG.POLL_BATCH_SIZE;
-  pollProgress = { current: 0, total: allWallets.length };
-
-  for (let i = 0; i < allWallets.length; i += batchSize) {
-    const batch = allWallets.slice(i, i + batchSize);
-    await Promise.allSettled(batch.map(w => pollWallet(w)));
-    
-    pollProgress.current = Math.min(i + batchSize, allWallets.length);
-    
-    // Recompute stats after each batch so the dashboard updates progressively
-    recomputeStats();
-    
-    // Small delay between batches to be nice to the API
-    if (i + batchSize < allWallets.length) {
-      await new Promise(r => setTimeout(r, 500));
-    }
+function cadenceFor(tier) {
+  switch (tier) {
+    case 'urgent': return CONFIG.POLL_URGENT_MS;
+    case 'soon':   return CONFIG.POLL_SOON_MS;
+    case 'normal': return CONFIG.POLL_NORMAL_MS;
+    case 'idle':   return CONFIG.POLL_IDLE_MS;
+    default:       return CONFIG.POLL_NORMAL_MS;
   }
-
-  // Final stats update
-  recomputeStats();
-  isPolling = false;
-  console.log(`[poll] Cycle complete. ${allWallets.length} wallets polled.`);
 }
 
-// Start polling cycle
-setInterval(pollAllWallets, CONFIG.POLL_INTERVAL_MS);
+function classifyWallet(w) {
+  const snap = snapshot[w.id];
+  if (!snap || !snap.updated_at) return 'urgent';       // never polled → ASAP
+  if (snap.error) return 'soon';                        // errored → retry ~5min
+  const claimables = snap.claimables || [];
+  if (claimables.some(cb => cb.is_claimable_now)) return 'urgent'; // unclaimed sitting
+  let minMsLeft = Infinity;
+  for (const cb of claimables) {
+    if (cb.unlock_time) {
+      const ms = new Date(cb.unlock_time).getTime() - Date.now();
+      if (ms > 0 && ms < minMsLeft) minMsLeft = ms;
+    }
+  }
+  if (minMsLeft <= REMINDER_2H_MS) return 'urgent';
+  if (minMsLeft <= REMINDER_24H_MS) return 'soon';
+  if (snap.account_exists || claimables.length > 0) return 'normal';
+  return 'idle';
+}
 
-// ═══════════════════════════ AUTH MIDDLEWARE ═══════════════════════════
+function scheduleNext(w) {
+  const tier = classifyWallet(w);
+  w.tier = tier;
+  const base = cadenceFor(tier);
+  const jitter = Math.random() * base * 0.1; // 10% jitter to avoid stampedes
+  w.next_poll_at = Date.now() + base + jitter;
+}
+
+function scheduleImmediate(walletId) {
+  const w = wallets.get(walletId);
+  if (!w) return;
+  w.next_poll_at = 0; // pick up on next tick
+}
+
+function tickScheduler() {
+  const now = Date.now();
+  for (const w of wallets.values()) {
+    if (scheduledSet.has(w.id) || inFlight.has(w.id)) continue;
+    if (!w.next_poll_at || w.next_poll_at <= now) {
+      workQueue.push(w.id);
+      scheduledSet.add(w.id);
+    }
+  }
+}
+
+async function worker(idx) {
+  while (schedulerRunning) {
+    const walletId = workQueue.shift();
+    if (!walletId) { await sleep(50); continue; }
+    scheduledSet.delete(walletId);
+    const w = wallets.get(walletId);
+    if (!w) continue; // deleted between queue and drain
+    inFlight.add(walletId);
+    try {
+      await pollWallet(w);
+    } catch (e) {
+      console.error(`[worker ${idx}] pollWallet crashed:`, e.message);
+    } finally {
+      inFlight.delete(walletId);
+      if (wallets.has(walletId)) scheduleNext(w);
+    }
+  }
+}
+
+function startScheduler() {
+  schedulerRunning = true;
+  setInterval(tickScheduler, 250);
+  for (let i = 0; i < CONFIG.MAX_CONCURRENCY; i++) worker(i);
+  setInterval(recomputeStats, 3000);
+  console.log(`[scheduler] ${CONFIG.MAX_CONCURRENCY} workers, target rps=${CONFIG.MAX_RPS}`);
+  console.log(`[scheduler] cadence — urgent:${CONFIG.POLL_URGENT_MS}ms soon:${CONFIG.POLL_SOON_MS}ms normal:${CONFIG.POLL_NORMAL_MS}ms idle:${CONFIG.POLL_IDLE_MS}ms`);
+}
+
+// ═══════════════════════════ HORIZON PAYMENT STREAM (SSE) ═══════════════════════════
+// Single global stream of all payments on the network. We filter locally against
+// a public-key index. On a hit, we schedule the affected wallet for an immediate
+// re-poll so the existing email logic handles alerting (no duplication).
+
+const streamState = {
+  active: false,
+  cursor: 'now',
+  lastEventAt: null,
+  publicKeyIndex: new Map(),
+  reconnectAttempts: 0,
+};
+
+function refreshStreamIndex() {
+  streamState.publicKeyIndex.clear();
+  for (const w of wallets.values()) streamState.publicKeyIndex.set(w.public_key, w.id);
+}
+
+function startPaymentStream() {
+  if (!CONFIG.ENABLE_PAYMENT_STREAM) {
+    console.log('[stream] disabled via ENABLE_PAYMENT_STREAM=false');
+    return;
+  }
+  refreshStreamIndex();
+  setInterval(refreshStreamIndex, 30000);
+
+  let closeFn = null;
+  function connect() {
+    try {
+      const h = new HorizonServer(CONFIG.HORIZON_URL);
+      console.log(`[stream] connecting cursor=${streamState.cursor}`);
+      closeFn = h.payments().cursor(streamState.cursor).stream({
+        onmessage: (p) => {
+          streamState.active = true;
+          streamState.lastEventAt = Date.now();
+          streamState.cursor = p.paging_token || streamState.cursor;
+          streamState.reconnectAttempts = 0;
+          const walletId = streamState.publicKeyIndex.get(p.to) || streamState.publicKeyIndex.get(p.from);
+          if (walletId) scheduleImmediate(walletId);
+        },
+        onerror: (e) => {
+          streamState.active = false;
+          console.error('[stream] error:', e?.message || 'connection error');
+          try { closeFn && closeFn(); } catch (_) {}
+          streamState.reconnectAttempts++;
+          const backoff = Math.min(60000, 2000 * Math.pow(2, Math.min(streamState.reconnectAttempts, 5)));
+          setTimeout(connect, backoff);
+        },
+      });
+    } catch (e) {
+      streamState.active = false;
+      console.error('[stream] failed to start:', e.message);
+      setTimeout(connect, 10000);
+    }
+  }
+  connect();
+}
+
+// ═══════════════════════════ AUTH ═══════════════════════════
 
 const authRequired = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -402,10 +626,7 @@ app.post('/api/wallets', authRequired, (req, res) => {
     const { phrases } = req.body || {};
     if (!phrases || !phrases.trim()) return res.status(400).json({ success: false, error: 'phrases required' });
 
-    // Split on newlines, commas, semicolons, or any common delimiter
     let rawLines = phrases.split(/[\r\n;,]+/).map(p => p.trim()).filter(p => p.length > 0);
-
-    // For each line, if it has more than 24 words, split into 24-word chunks
     const phraseList = [];
     for (const line of rawLines) {
       const words = line.split(/\s+/).filter(w => w.length > 0);
@@ -414,25 +635,18 @@ app.post('/api/wallets', authRequired, (req, res) => {
       } else {
         for (let i = 0; i < words.length; i += 24) {
           const chunk = words.slice(i, i + 24).join(' ');
-          if (chunk.split(/\s+/).length >= 12) {
-            phraseList.push(chunk);
-          }
+          if (chunk.split(/\s+/).length >= 12) phraseList.push(chunk);
         }
       }
     }
-
     if (phraseList.length === 0) return res.status(400).json({ success: false, error: 'no valid phrases' });
 
     const totalPhrases = phraseList.length;
-    console.log(`[wallets] Queued ${totalPhrases} phrases for background processing...`);
-
-    // Respond immediately — processing happens in background
+    console.log(`[wallets] Queued ${totalPhrases} phrases for background derivation...`);
     res.json({ success: true, added: 0, queued: totalPhrases, total: wallets.size + totalPhrases, processing: true });
 
-    // Process derivations in background chunks to avoid blocking event loop
     let idx = 0;
     const CHUNK_SIZE = 50;
-
     function processChunk() {
       const end = Math.min(idx + CHUNK_SIZE, phraseList.length);
       for (let i = idx; i < end; i++) {
@@ -447,23 +661,17 @@ app.post('/api/wallets', authRequired, (req, res) => {
             phrase_preview: getPhrasePreview(phrase),
             public_key: kp.publicKey(),
             created_at: new Date().toISOString(),
-            last_payment_cursor: null
+            last_payment_cursor: null,
+            next_poll_at: 0,    // fire ASAP
+            tier: 'urgent',
           });
-        } catch (e) {
-          // Skip invalid phrases silently
-        }
+        } catch (_) { /* skip invalid phrases silently */ }
       }
       idx = end;
       cachedStats.total_wallets = wallets.size;
-
-      if (idx < phraseList.length) {
-        setImmediate(processChunk);
-      } else {
-        console.log(`[wallets] Background processing complete. Total wallets: ${wallets.size}`);
-        if (!isPolling) pollAllWallets();
-      }
+      if (idx < phraseList.length) setImmediate(processChunk);
+      else console.log(`[wallets] Background derivation done. Total: ${wallets.size}`);
     }
-
     setImmediate(processChunk);
   } catch (e) {
     res.status(400).json({ success: false, error: e.message });
@@ -471,14 +679,11 @@ app.post('/api/wallets', authRequired, (req, res) => {
 });
 
 app.get('/api/wallets', authRequired, (req, res) => {
-  // Pagination for large wallet sets
   const page = parseInt(req.query.page) || 1;
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = (page - 1) * limit;
 
   const allWallets = Array.from(wallets.values());
-
-  // Build the sorted list with computed fields
   const enriched = allWallets.map(w => {
     const snap = snapshot[w.id] || {};
     const claimables = snap.claimables || [];
@@ -512,10 +717,10 @@ app.get('/api/wallets', authRequired, (req, res) => {
       unlocked_unclaimed_count,
       unlocked_unclaimed_total,
       polled: !!snap.updated_at,
+      tier: w.tier || 'urgent',
     };
   });
 
-  // Sort: unclaimed first → closest unlock → no unlocks last
   enriched.sort((a, b) => {
     const aUnclaimed = a.unlocked_unclaimed_count > 0;
     const bUnclaimed = b.unlocked_unclaimed_count > 0;
@@ -533,14 +738,10 @@ app.get('/api/wallets', authRequired, (req, res) => {
   });
 
   const paginated = enriched.slice(offset, offset + limit);
-
-  // Always compute fresh stats from current snapshot data
-  const freshStats = recomputeStats();
-
   res.json({
     success: true,
     wallets: paginated,
-    stats: freshStats,
+    stats: cachedStats,
     pagination: {
       page,
       limit,
@@ -555,11 +756,32 @@ app.delete('/api/wallets/:id', authRequired, (req, res) => {
   if (!wallets.has(id)) return res.status(404).json({ success: false, error: 'not found' });
   wallets.delete(id);
   delete snapshot[id];
+  scheduledSet.delete(id);
   Array.from(claimableTracked.entries()).forEach(([cbId, t]) => {
     if (t.wallet_id === id) claimableTracked.delete(cbId);
   });
-  recomputeStats();
+  Array.from(unclaimedNotified).forEach(k => {
+    if (k.startsWith(id + ':')) unclaimedNotified.delete(k);
+  });
   res.json({ success: true });
 });
 
-app.listen(CONFIG.PORT, () => console.log('✓ Pi Wallet Monitor API running on port ' + CONFIG.PORT));
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    wallets: wallets.size,
+    inflight: inFlight.size,
+    queue: workQueue.length,
+    rps: parseFloat(rateState.rps.toFixed(1)),
+    throttled: rateState.backoffUntil > Date.now(),
+    stream: streamState.active,
+  });
+});
+
+// ═══════════════════════════ BOOT ═══════════════════════════
+
+app.listen(CONFIG.PORT, () => {
+  console.log(`✓ Pi Wallet Monitor API listening on :${CONFIG.PORT}`);
+  startScheduler();
+  startPaymentStream();
+});

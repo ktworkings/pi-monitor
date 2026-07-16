@@ -116,6 +116,17 @@ function WalletRow({ wallet, index, onDelete }) {
   );
 }
 
+function formatDuration(ms) {
+  if (!ms || ms < 0) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 function Dashboard({ onLogout }) {
   const [wallets, setWallets] = useState([]);
   const [stats, setStats] = useState({
@@ -126,6 +137,14 @@ function Dashboard({ onLogout }) {
     total_unlocked_unclaimed: '0.0000000',
     total_unlocked_unclaimed_count: 0,
     polled_wallets: 0,
+    tier_counts: { urgent: 0, soon: 0, normal: 0, idle: 0 },
+    poll_lag_avg_ms: 0,
+    poll_lag_max_ms: 0,
+    rate_limit_rps: 0,
+    rate_limit_active: false,
+    in_flight: 0,
+    queue_depth: 0,
+    stream_active: false,
   });
   const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
   const [page, setPage] = useState(1);
@@ -224,6 +243,26 @@ function Dashboard({ onLogout }) {
           <div className="stat-value stat-value-alert">{parseFloat(stats.total_unlocked_unclaimed || 0).toFixed(4)} PI</div>
           <div className="stat-sub">{stats.total_unlocked_unclaimed_count || 0} balances</div>
         </div>
+      </div>
+
+      <div className="system-status">
+        <span className="sys-item"><b>Queue</b> {stats.queue_depth || 0}</span>
+        <span className="sys-item"><b>In-flight</b> {stats.in_flight || 0}</span>
+        <span className={`sys-item ${stats.rate_limit_active ? 'sys-warn' : ''}`}>
+          <b>Rate</b> {stats.rate_limit_rps || 0} rps{stats.rate_limit_active ? ' · throttled' : ''}
+        </span>
+        <span className="sys-item"><b>Avg lag</b> {formatDuration(stats.poll_lag_avg_ms)}</span>
+        <span className="sys-item"><b>Max lag</b> {formatDuration(stats.poll_lag_max_ms)}</span>
+        <span className={`sys-item ${stats.stream_active ? 'sys-ok' : 'sys-warn'}`}>
+          <b>Stream</b> {stats.stream_active ? '● live' : '○ off'}
+        </span>
+        <span className="sys-item">
+          <b>Tiers</b>{' '}
+          <span title="urgent">U:{stats.tier_counts?.urgent || 0}</span>{' '}
+          <span title="soon">S:{stats.tier_counts?.soon || 0}</span>{' '}
+          <span title="normal">N:{stats.tier_counts?.normal || 0}</span>{' '}
+          <span title="idle">I:{stats.tier_counts?.idle || 0}</span>
+        </span>
       </div>
 
       <div className="card">

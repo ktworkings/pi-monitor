@@ -394,3 +394,37 @@ td {
   color: #778;
   font-weight: 400;
 }
+
+
+/* Scheduler / rate-limit / stream health strip */
+.system-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 22px;
+  padding: 10px 14px;
+  margin: -10px 0 22px;
+  background: #0c1c2c;
+  border: 1px solid #17324a;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #8aa2b8;
+  font-family: 'Segoe UI', Arial, sans-serif;
+}
+
+.system-status .sys-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: 0.2px;
+}
+
+.system-status .sys-item b {
+  color: #00d4ff;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.6px;
+}
+
+.system-status .sys-ok    { color: #4caf50; }
+.system-status .sys-warn  { color: #ff9800; }
