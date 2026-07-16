@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { getWallets, addWallets, deleteWallet } from '../api';
 import './Dashboard.css';
 
@@ -131,8 +131,6 @@ function Dashboard({ onLogout }) {
   const [page, setPage] = useState(1);
   const [phrases, setPhrases] = useState('');
   const [adding, setAdding] = useState(false);
-  // Use a ref to hold stable stats — only update when polled_wallets increases or stays same
-  const stableStatsRef = useRef(stats);
 
   const refresh = useCallback(async () => {
     try {
@@ -140,17 +138,9 @@ function Dashboard({ onLogout }) {
       if (data.success) {
         setWallets(data.wallets);
         setPagination(data.pagination);
-
-        // Only update displayed stats if the new polled count >= previous
-        // This prevents stats from fluctuating down when a poll cycle restarts
-        const newStats = data.stats;
-        const prevPolled = stableStatsRef.current.polled_wallets || 0;
-        const newPolled = newStats.polled_wallets || 0;
-
-        if (newPolled >= prevPolled || prevPolled === 0) {
-          stableStatsRef.current = newStats;
-          setStats(newStats);
-        }
+        // Stats are now computed fresh on the backend each request
+        // No need for client-side "stable stats" logic
+        setStats(data.stats);
       }
     } catch (err) {
       console.error('Failed to refresh:', err);

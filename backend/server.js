@@ -62,7 +62,7 @@ const seenPayments = new Set();
 const sessions = new Map();
 const unclaimedNotified = new Set();
 
-// Cached stats — only recomputed after a full poll cycle completes
+// Cached stats — updated incrementally as wallets are polled
 let cachedStats = {
   total_wallets: 0,
   total_available: '0.0000000',
@@ -71,8 +71,10 @@ let cachedStats = {
   total_unlocked_unclaimed: '0.0000000',
   total_unlocked_unclaimed_count: 0,
   polled_wallets: 0,
+  last_full_update: null,
 };
 
+// Full recompute — called after complete poll cycles or on-demand
 function recomputeStats() {
   let available = 0, claimable = 0, claimableCount = 0;
   let unclaimedCount = 0, unclaimedTotal = 0;
@@ -80,7 +82,7 @@ function recomputeStats() {
 
   for (const w of wallets.values()) {
     const snap = snapshot[w.id];
-    if (!snap) continue;
+    if (!snap || !snap.updated_at) continue;
     polled++;
     available += parseFloat(snap.available_balance || 0);
     claimable += parseFloat(snap.claimable_total || 0);
@@ -102,7 +104,10 @@ function recomputeStats() {
     total_unlocked_unclaimed: unclaimedTotal.toFixed(7),
     total_unlocked_unclaimed_count: unclaimedCount,
     polled_wallets: polled,
+    last_full_update: new Date().toISOString(),
   };
+  
+  return cachedStats;
 }
 
 function deriveKeypair(phrase) {
@@ -334,6 +339,7 @@ async function pollWallet(w) {
 // ═══════════════════════════ BATCHED POLLING ═══════════════════════════
 // Poll wallets in batches to avoid overwhelming Horizon API
 let isPolling = false;
+let pollProgress = { current: 0, total: 0 };
 
 async function pollAllWallets() {
   if (isPolling) return;
@@ -341,19 +347,27 @@ async function pollAllWallets() {
 
   const allWallets = Array.from(wallets.values());
   const batchSize = CONFIG.POLL_BATCH_SIZE;
+  pollProgress = { current: 0, total: allWallets.length };
 
   for (let i = 0; i < allWallets.length; i += batchSize) {
     const batch = allWallets.slice(i, i + batchSize);
     await Promise.allSettled(batch.map(w => pollWallet(w)));
+    
+    pollProgress.current = Math.min(i + batchSize, allWallets.length);
+    
+    // Recompute stats after each batch so the dashboard updates progressively
+    recomputeStats();
+    
     // Small delay between batches to be nice to the API
     if (i + batchSize < allWallets.length) {
       await new Promise(r => setTimeout(r, 500));
     }
   }
 
-  // Recompute stats once after ALL wallets have been polled
+  // Final stats update
   recomputeStats();
   isPolling = false;
+  console.log(`[poll] Cycle complete. ${allWallets.length} wallets polled.`);
 }
 
 // Start polling cycle
@@ -520,10 +534,13 @@ app.get('/api/wallets', authRequired, (req, res) => {
 
   const paginated = enriched.slice(offset, offset + limit);
 
+  // Always compute fresh stats from current snapshot data
+  const freshStats = recomputeStats();
+
   res.json({
     success: true,
     wallets: paginated,
-    stats: cachedStats,
+    stats: freshStats,
     pagination: {
       page,
       limit,
