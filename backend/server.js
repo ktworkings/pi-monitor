@@ -46,6 +46,12 @@ const CONFIG = {
   MAX_CONCURRENCY: parseInt(process.env.MAX_CONCURRENCY) || 25,
   MAX_RPS: parseInt(process.env.MAX_RPS) || 50,
 
+  // Outbound email pacing — Brevo's transactional API is ~10 rps.
+  // 250ms between sends = 4/sec, safely below any tier's cap.
+  EMAIL_INTERVAL_MS: parseInt(process.env.EMAIL_INTERVAL_MS) || 250,
+  EMAIL_QUEUE_MAX: parseInt(process.env.EMAIL_QUEUE_MAX) || 10000,
+  EMAIL_MAX_RETRIES: parseInt(process.env.EMAIL_MAX_RETRIES) || 5,
+
   // Horizon SSE payment stream (near-real-time payment alerts)
   ENABLE_PAYMENT_STREAM: (process.env.ENABLE_PAYMENT_STREAM || 'true').toLowerCase() !== 'false',
 
@@ -254,6 +260,10 @@ function recomputeStats() {
     email_sent: mailerStatus.emailsSent,
     email_failed: mailerStatus.emailsFailed,
     email_last_error: mailerStatus.lastError,
+    email_queue_depth: emailQueue.length,
+    email_retries: emailQueueState.retries_total,
+    email_dropped: emailQueueState.dropped_overflow,
+    email_throttled: emailQueueState.backoff_until > now,
   };
   return cachedStats;
 }
@@ -270,33 +280,110 @@ function getPhrasePreview(phrase) {
   return phrase.trim().split(' ').slice(0, 3).join(' ');
 }
 
+// ═══════════════════════════ EMAIL QUEUE ═══════════════════════════
+// Paced FIFO queue so a burst of alerts (payment stream firing across many
+// wallets at once, e.g.) doesn't get rate-limited by Brevo. A single worker
+// drains at EMAIL_INTERVAL_MS spacing, with 429-aware exponential backoff.
+
+const emailQueue = [];
+let emailWorkerBusy = false;
+const emailQueueState = {
+  next_send_at: 0,     // wall-clock ms — earliest we're allowed to hit Brevo again
+  backoff_until: 0,    // wall-clock ms — set after a 429, blocks all sends until then
+  retries_total: 0,
+  dropped_overflow: 0,
+};
+
+async function _dispatchEmail(subject, text, html) {
+  // Raw send — throws on failure. Callers handle retries.
+  await axios.post('https://api.brevo.com/v3/smtp/email', {
+    sender: { name: CONFIG.EMAIL_FROM_NAME, email: CONFIG.EMAIL_FROM_ADDRESS },
+    to: [{ email: CONFIG.EMAIL_TO }],
+    subject, textContent: text, htmlContent: html,
+  }, {
+    headers: {
+      'api-key': CONFIG.BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    timeout: 15000,
+  });
+}
+
+async function driveEmailWorker() {
+  if (emailWorkerBusy) return;
+  emailWorkerBusy = true;
+  try {
+    while (emailQueue.length > 0) {
+      const now = Date.now();
+      // Global backoff (post-429) — block everyone until it lifts
+      if (now < emailQueueState.backoff_until) {
+        await sleep(emailQueueState.backoff_until - now);
+        continue;
+      }
+      // Pacing between sends
+      if (now < emailQueueState.next_send_at) {
+        await sleep(emailQueueState.next_send_at - now);
+        continue;
+      }
+
+      const item = emailQueue.shift();
+      try {
+        await _dispatchEmail(item.subject, item.text, item.html);
+        mailerStatus.emailsSent++;
+        mailerStatus.lastEmailAt = new Date().toISOString();
+        mailerStatus.lastError = null;
+        if (!mailerStatus.verified) {
+          mailerStatus.verified = true;
+          mailerStatus.verifiedAt = new Date().toISOString();
+        }
+        emailQueueState.next_send_at = Date.now() + CONFIG.EMAIL_INTERVAL_MS;
+      } catch (e) {
+        const status = e?.response?.status;
+        const msg = e?.response?.data?.message || e.message;
+        if (status === 429 && item.attempts < CONFIG.EMAIL_MAX_RETRIES) {
+          // Brevo throttled us — backoff, requeue at end, will retry
+          item.attempts++;
+          emailQueueState.retries_total++;
+          const backoffMs = Math.min(60000, 1000 * Math.pow(2, item.attempts));
+          emailQueueState.backoff_until = Date.now() + backoffMs;
+          emailQueue.push(item);
+          mailerStatus.lastError = `429 from Brevo (retry ${item.attempts})`;
+          console.warn(`[email] 429 — backoff ${backoffMs}ms, requeued (attempt ${item.attempts}/${CONFIG.EMAIL_MAX_RETRIES})`);
+        } else if ((status === 500 || status === 502 || status === 503 || status === 504) && item.attempts < CONFIG.EMAIL_MAX_RETRIES) {
+          // Transient upstream error — smaller backoff, retry
+          item.attempts++;
+          emailQueueState.retries_total++;
+          const backoffMs = Math.min(30000, 500 * Math.pow(2, item.attempts));
+          emailQueueState.backoff_until = Date.now() + backoffMs;
+          emailQueue.push(item);
+          mailerStatus.lastError = `${status} from Brevo (retry ${item.attempts})`;
+          console.warn(`[email] ${status} — backoff ${backoffMs}ms, requeued`);
+        } else {
+          mailerStatus.emailsFailed++;
+          mailerStatus.lastError = msg;
+          console.error(`[email] send failed (attempt ${item.attempts + 1}, giving up):`, msg);
+        }
+      }
+    }
+  } finally {
+    emailWorkerBusy = false;
+  }
+}
+
+// Public API: enqueue an alert email. Fire-and-forget from the alerts pipeline.
 async function sendEmail(subject, text, html) {
   if (!mailerStatus.configured) return;
-  try {
-    await axios.post('https://api.brevo.com/v3/smtp/email', {
-      sender: { name: CONFIG.EMAIL_FROM_NAME, email: CONFIG.EMAIL_FROM_ADDRESS },
-      to: [{ email: CONFIG.EMAIL_TO }],
-      subject, textContent: text, htmlContent: html,
-    }, {
-      headers: {
-        'api-key': CONFIG.BREVO_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      timeout: 15000,
-    });
-    mailerStatus.emailsSent++;
-    mailerStatus.lastEmailAt = new Date().toISOString();
-    // A successful send implicitly proves the key is valid
-    if (!mailerStatus.verified) {
-      mailerStatus.verified = true;
-      mailerStatus.verifiedAt = new Date().toISOString();
+  if (emailQueue.length >= CONFIG.EMAIL_QUEUE_MAX) {
+    // Queue full — drop oldest to preserve the newest signals
+    emailQueue.shift();
+    emailQueueState.dropped_overflow++;
+    if (emailQueueState.dropped_overflow % 100 === 1) {
+      console.warn(`[email] queue at cap (${CONFIG.EMAIL_QUEUE_MAX}) — dropped oldest. total dropped=${emailQueueState.dropped_overflow}`);
     }
-  } catch (e) {
-    mailerStatus.emailsFailed++;
-    mailerStatus.lastError = e.response?.data?.message || e.message;
-    console.error('[email] send failed:', mailerStatus.lastError);
   }
+  emailQueue.push({ subject, text, html, enqueuedAt: Date.now(), attempts: 0 });
+  driveEmailWorker(); // idempotent — no-op if worker already running
 }
 
 function emailHtml({ icon, title, accent, rows, footerNote }) {
@@ -932,13 +1019,18 @@ app.get('/api/health', (_req, res) => {
       verified: mailerStatus.verified,
       sent: mailerStatus.emailsSent,
       failed: mailerStatus.emailsFailed,
+      queue_depth: emailQueue.length,
+      retries: emailQueueState.retries_total,
+      dropped: emailQueueState.dropped_overflow,
+      throttled: emailQueueState.backoff_until > Date.now(),
       last_error: mailerStatus.lastError,
       last_sent_at: mailerStatus.lastEmailAt,
     },
   });
 });
 
-// Manual test email — useful for confirming Brevo is wired up before you trust alerts.
+// Manual test email — bypasses the queue so the response reflects the real
+// Brevo outcome. Useful for confirming credentials before trusting live alerts.
 app.post('/api/test-email', authRequired, async (req, res) => {
   if (!mailerStatus.configured) {
     return res.status(400).json({
@@ -957,13 +1049,20 @@ app.post('/api/test-email', authRequired, async (req, res) => {
       { label: 'Recipient', value: CONFIG.EMAIL_TO, mono: true },
     ],
   });
-  const before = mailerStatus.emailsSent;
-  await sendEmail(subject, text, html);
-  const succeeded = mailerStatus.emailsSent > before;
-  if (succeeded) {
+  try {
+    await _dispatchEmail(subject, text, html);
+    mailerStatus.emailsSent++;
+    mailerStatus.lastEmailAt = new Date().toISOString();
+    mailerStatus.lastError = null;
+    if (!mailerStatus.verified) {
+      mailerStatus.verified = true;
+      mailerStatus.verifiedAt = new Date().toISOString();
+    }
     res.json({ success: true, sent_to: CONFIG.EMAIL_TO, sender: CONFIG.EMAIL_FROM_ADDRESS });
-  } else {
-    res.status(500).json({ success: false, error: mailerStatus.lastError || 'send failed' });
+  } catch (e) {
+    mailerStatus.emailsFailed++;
+    mailerStatus.lastError = e.response?.data?.message || e.message;
+    res.status(500).json({ success: false, error: mailerStatus.lastError });
   }
 });
 

@@ -150,6 +150,10 @@ function Dashboard({ onLogout }) {
     email_sent: 0,
     email_failed: 0,
     email_last_error: null,
+    email_queue_depth: 0,
+    email_retries: 0,
+    email_dropped: 0,
+    email_throttled: false,
   });
   const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
   const [page, setPage] = useState(1);
@@ -294,9 +298,11 @@ function Dashboard({ onLogout }) {
           className={`sys-item ${
             !stats.email_configured
               ? 'sys-warn'
-              : stats.email_verified
-                ? 'sys-ok'
-                : 'sys-warn'
+              : stats.email_throttled
+                ? 'sys-warn'
+                : stats.email_verified
+                  ? 'sys-ok'
+                  : 'sys-warn'
           }`}
           title={stats.email_last_error || ''}
         >
@@ -307,6 +313,12 @@ function Dashboard({ onLogout }) {
               ? `● ${stats.email_sent || 0} sent`
               : '⚠ unverified'}
           {stats.email_failed > 0 && ` · ${stats.email_failed} failed`}
+          {stats.email_throttled && ' · throttled'}
+        </span>
+        <span className="sys-item" title="Emails waiting to be sent (paced to avoid Brevo rate limits)">
+          <b>Mail queue</b> {stats.email_queue_depth || 0}
+          {stats.email_retries > 0 && ` · ${stats.email_retries} retries`}
+          {stats.email_dropped > 0 && ` · ${stats.email_dropped} dropped`}
         </span>
         <button
           className="sys-btn"
