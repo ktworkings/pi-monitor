@@ -4,7 +4,7 @@
  * - Add wallets by pasting phrases (one per line, bulk add supported)
  * - Adaptive scheduler + worker pool with rate-limit-aware backoff
  * - Optional Horizon SSE payment stream for near-real-time alerts
- * - Email alerts via Brevo SMTP on: new claimable balance,
+ * - Email alerts via Gmail SMTP on: new claimable balance,
  *   ~24h/~2h before unlock, payment in/out, and unlocked-but-unclaimed
  * - Read-only, never builds or submits transactions
  * ---------------------------------------------------------------
@@ -18,6 +18,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const bip39 = require('bip39');
 const hdkey = require('ed25519-hd-key');
+const nodemailer = require('nodemailer');
 const { Keypair, Horizon } = require('stellar-sdk');
 const HorizonServer = Horizon.Server;
 
@@ -46,8 +47,9 @@ const CONFIG = {
   MAX_CONCURRENCY: parseInt(process.env.MAX_CONCURRENCY) || 25,
   MAX_RPS: parseInt(process.env.MAX_RPS) || 50,
 
-  // Outbound email pacing — Brevo's transactional API is ~10 rps.
-  // 250ms between sends = 4/sec, safely below any tier's cap.
+  // Outbound email pacing — Gmail SMTP caps ~500/day per account and will
+  // return SMTP 421 on bursty senders. 250ms between sends = 4/sec, well
+  // below anything Gmail throttles under.
   EMAIL_INTERVAL_MS: parseInt(process.env.EMAIL_INTERVAL_MS) || 250,
   EMAIL_QUEUE_MAX: parseInt(process.env.EMAIL_QUEUE_MAX) || 10000,
   EMAIL_MAX_RETRIES: parseInt(process.env.EMAIL_MAX_RETRIES) || 5,
@@ -55,8 +57,14 @@ const CONFIG = {
   // Horizon SSE payment stream (near-real-time payment alerts)
   ENABLE_PAYMENT_STREAM: (process.env.ENABLE_PAYMENT_STREAM || 'true').toLowerCase() !== 'false',
 
-  BREVO_API_KEY: process.env.BREVO_API_KEY || '',
+  // Gmail SMTP — generate an app password at:
+  // https://myaccount.google.com/apppasswords (requires 2FA on the account).
+  GMAIL_USER: process.env.GMAIL_USER || '',
+  GMAIL_APP_PASSWORD: process.env.GMAIL_APP_PASSWORD || '',
   EMAIL_FROM_NAME: process.env.EMAIL_FROM_NAME || 'Pi Wallet Monitor',
+  // Optional. Gmail SMTP will rewrite the From header to GMAIL_USER unless
+  // this address is configured as a "Send mail as" alias in Gmail. Defaults
+  // to GMAIL_USER when empty.
   EMAIL_FROM_ADDRESS: process.env.EMAIL_FROM_ADDRESS || '',
   EMAIL_TO: process.env.EMAIL_TO || '',
   DASH_USER: process.env.DASH_USER || 'admin',
@@ -67,12 +75,13 @@ const PI_DERIVATION_PATH = "m/44'/314159'/0'";
 const REMINDER_24H_MS = 24 * 60 * 60 * 1000;
 const REMINDER_2H_MS = 2 * 60 * 60 * 1000;
 
-// ═══════════════════════════ EMAIL SERVICE STATUS ═══════════════════════════
-// Tracks whether Brevo is configured, whether the API key is verified against
-// Brevo's /v3/account endpoint, and running send counters.
+// ═══════════════════════════ EMAIL SERVICE (Gmail SMTP) ═══════════════════════════
+// Uses nodemailer with a pooled Gmail SMTP transporter. Auth is Gmail address +
+// app password (16-char generated at https://myaccount.google.com/apppasswords).
+// Gmail caps at ~500 sends/day per account; the queue paces below that.
 
 const mailerStatus = {
-  configured: !!(CONFIG.BREVO_API_KEY && CONFIG.EMAIL_FROM_ADDRESS && CONFIG.EMAIL_TO),
+  configured: !!(CONFIG.GMAIL_USER && CONFIG.GMAIL_APP_PASSWORD && CONFIG.EMAIL_TO),
   verified: false,
   verifiedAt: null,
   lastError: null,
@@ -84,27 +93,60 @@ const mailerStatus = {
 };
 
 if (!mailerStatus.configured) {
-  console.warn('[email] Brevo not configured — set BREVO_API_KEY, EMAIL_FROM_ADDRESS, EMAIL_TO in .env');
+  console.warn('[email] Gmail SMTP not configured — set GMAIL_USER, GMAIL_APP_PASSWORD, EMAIL_TO in .env');
+}
+
+let transporter = null;
+
+function initTransporter() {
+  if (!mailerStatus.configured) return;
+  transporter = nodemailer.createTransport({
+    service: 'gmail',           // shortcut for smtp.gmail.com:465 secure
+    auth: {
+      user: CONFIG.GMAIL_USER,
+      pass: CONFIG.GMAIL_APP_PASSWORD,
+    },
+    pool: true,                 // reuse SMTP connections across sends
+    maxConnections: 3,
+    maxMessages: 100,
+    connectionTimeout: 20000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
+  });
 }
 
 async function verifyMailer() {
   if (!mailerStatus.configured) return;
+  if (!transporter) initTransporter();
   try {
-    const r = await axios.get('https://api.brevo.com/v3/account', {
-      headers: { 'api-key': CONFIG.BREVO_API_KEY, 'Accept': 'application/json' },
-      timeout: 10000,
-    });
+    await transporter.verify();
     mailerStatus.verified = true;
     mailerStatus.verifiedAt = new Date().toISOString();
     mailerStatus.lastError = null;
-    mailerStatus.senderEmail = r.data?.email || null;
-    mailerStatus.planType = r.data?.plan?.[0]?.type || null;
-    console.log(`[email] Brevo verified — account=${mailerStatus.senderEmail || 'ok'} plan=${mailerStatus.planType || 'ok'}`);
+    mailerStatus.senderEmail = CONFIG.GMAIL_USER;
+    mailerStatus.planType = 'gmail-smtp';
+    console.log(`[email] Gmail SMTP verified — user=${CONFIG.GMAIL_USER}`);
   } catch (e) {
     mailerStatus.verified = false;
-    mailerStatus.lastError = e.response?.data?.message || e.message;
-    console.error('[email] Brevo verification failed:', mailerStatus.lastError);
+    mailerStatus.lastError = e.message;
+    console.error('[email] Gmail SMTP verification failed:', mailerStatus.lastError);
   }
+}
+
+// Classify a nodemailer error as retryable vs permanent.
+// SMTP responseCode: 4xx = transient, 5xx = permanent.
+// Errno-style code: ETIMEDOUT/ECONNECTION/ESOCKET/ECONNRESET = transient network issue.
+// EAUTH is permanent (bad app password).
+function isTransientMailerError(e) {
+  const rc = e?.responseCode;
+  const code = e?.code;
+  if (typeof rc === 'number') {
+    if (rc >= 400 && rc < 500) return true;
+    if (rc >= 500) return false;
+  }
+  if (code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET' || code === 'ECONNRESET' || code === 'EDNS') return true;
+  if (code === 'EAUTH' || code === 'EENVELOPE') return false;
+  return false;
 }
 
 const wallets = new Map();
@@ -282,31 +324,30 @@ function getPhrasePreview(phrase) {
 
 // ═══════════════════════════ EMAIL QUEUE ═══════════════════════════
 // Paced FIFO queue so a burst of alerts (payment stream firing across many
-// wallets at once, e.g.) doesn't get rate-limited by Brevo. A single worker
-// drains at EMAIL_INTERVAL_MS spacing, with 429-aware exponential backoff.
+// wallets at once, e.g.) doesn't trip Gmail's per-account throttling. A
+// single worker drains at EMAIL_INTERVAL_MS spacing, with exponential
+// backoff on transient SMTP errors (421/450/452) and network hiccups.
 
 const emailQueue = [];
 let emailWorkerBusy = false;
 const emailQueueState = {
-  next_send_at: 0,     // wall-clock ms — earliest we're allowed to hit Brevo again
-  backoff_until: 0,    // wall-clock ms — set after a 429, blocks all sends until then
+  next_send_at: 0,     // wall-clock ms — earliest we're allowed to hit SMTP again
+  backoff_until: 0,    // wall-clock ms — set after a transient error, blocks all sends until then
   retries_total: 0,
   dropped_overflow: 0,
 };
 
 async function _dispatchEmail(subject, text, html) {
   // Raw send — throws on failure. Callers handle retries.
-  await axios.post('https://api.brevo.com/v3/smtp/email', {
-    sender: { name: CONFIG.EMAIL_FROM_NAME, email: CONFIG.EMAIL_FROM_ADDRESS },
-    to: [{ email: CONFIG.EMAIL_TO }],
-    subject, textContent: text, htmlContent: html,
-  }, {
-    headers: {
-      'api-key': CONFIG.BREVO_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    timeout: 15000,
+  if (!transporter) initTransporter();
+  if (!transporter) throw new Error('Gmail SMTP not configured');
+  const fromAddress = CONFIG.EMAIL_FROM_ADDRESS || CONFIG.GMAIL_USER;
+  await transporter.sendMail({
+    from: `"${CONFIG.EMAIL_FROM_NAME}" <${fromAddress}>`,
+    to: CONFIG.EMAIL_TO,
+    subject,
+    text,
+    html,
   });
 }
 
@@ -339,30 +380,25 @@ async function driveEmailWorker() {
         }
         emailQueueState.next_send_at = Date.now() + CONFIG.EMAIL_INTERVAL_MS;
       } catch (e) {
-        const status = e?.response?.status;
-        const msg = e?.response?.data?.message || e.message;
-        if (status === 429 && item.attempts < CONFIG.EMAIL_MAX_RETRIES) {
-          // Brevo throttled us — backoff, requeue at end, will retry
+        const rc = e?.responseCode;
+        const code = e?.code;
+        const msg = e.message;
+        const label = rc ? `SMTP ${rc}` : (code || 'error');
+        if (isTransientMailerError(e) && item.attempts < CONFIG.EMAIL_MAX_RETRIES) {
           item.attempts++;
           emailQueueState.retries_total++;
-          const backoffMs = Math.min(60000, 1000 * Math.pow(2, item.attempts));
+          // 421 (Gmail rate-limit / temp reject) gets aggressive backoff; other transients gentler.
+          const isRateLimit = rc === 421 || rc === 450 || rc === 452;
+          const capMs = isRateLimit ? 60000 : 30000;
+          const backoffMs = Math.min(capMs, 1000 * Math.pow(2, item.attempts));
           emailQueueState.backoff_until = Date.now() + backoffMs;
           emailQueue.push(item);
-          mailerStatus.lastError = `429 from Brevo (retry ${item.attempts})`;
-          console.warn(`[email] 429 — backoff ${backoffMs}ms, requeued (attempt ${item.attempts}/${CONFIG.EMAIL_MAX_RETRIES})`);
-        } else if ((status === 500 || status === 502 || status === 503 || status === 504) && item.attempts < CONFIG.EMAIL_MAX_RETRIES) {
-          // Transient upstream error — smaller backoff, retry
-          item.attempts++;
-          emailQueueState.retries_total++;
-          const backoffMs = Math.min(30000, 500 * Math.pow(2, item.attempts));
-          emailQueueState.backoff_until = Date.now() + backoffMs;
-          emailQueue.push(item);
-          mailerStatus.lastError = `${status} from Brevo (retry ${item.attempts})`;
-          console.warn(`[email] ${status} — backoff ${backoffMs}ms, requeued`);
+          mailerStatus.lastError = `${label} from Gmail (retry ${item.attempts})`;
+          console.warn(`[email] transient ${label} — backoff ${backoffMs}ms, requeued (attempt ${item.attempts}/${CONFIG.EMAIL_MAX_RETRIES})`);
         } else {
           mailerStatus.emailsFailed++;
           mailerStatus.lastError = msg;
-          console.error(`[email] send failed (attempt ${item.attempts + 1}, giving up):`, msg);
+          console.error(`[email] send failed (${label}, attempt ${item.attempts + 1}, giving up):`, msg);
         }
       }
     }
@@ -1030,12 +1066,12 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Manual test email — bypasses the queue so the response reflects the real
-// Brevo outcome. Useful for confirming credentials before trusting live alerts.
+// Gmail SMTP outcome. Useful for confirming credentials before trusting live alerts.
 app.post('/api/test-email', authRequired, async (req, res) => {
   if (!mailerStatus.configured) {
     return res.status(400).json({
       success: false,
-      error: 'Email not configured. Set BREVO_API_KEY, EMAIL_FROM_ADDRESS, EMAIL_TO in .env',
+      error: 'Email not configured. Set GMAIL_USER, GMAIL_APP_PASSWORD, EMAIL_TO in .env',
     });
   }
   const subject = '✅ Pi Wallet Monitor — Test Email';
@@ -1044,7 +1080,7 @@ app.post('/api/test-email', authRequired, async (req, res) => {
     icon: '✅', title: 'Test Email', accent: '#4caf50',
     rows: [
       { label: 'Sent At', value: new Date().toLocaleString() },
-      { label: 'Result', value: 'If you can see this, your Brevo configuration is working.' },
+      { label: 'Result', value: 'If you can see this, your Gmail SMTP configuration is working.' },
       { label: 'Sender', value: CONFIG.EMAIL_FROM_ADDRESS, mono: true },
       { label: 'Recipient', value: CONFIG.EMAIL_TO, mono: true },
     ],
@@ -1061,7 +1097,8 @@ app.post('/api/test-email', authRequired, async (req, res) => {
     res.json({ success: true, sent_to: CONFIG.EMAIL_TO, sender: CONFIG.EMAIL_FROM_ADDRESS });
   } catch (e) {
     mailerStatus.emailsFailed++;
-    mailerStatus.lastError = e.response?.data?.message || e.message;
+    const label = e?.responseCode ? `SMTP ${e.responseCode}` : (e?.code || 'error');
+    mailerStatus.lastError = `${label}: ${e.message}`;
     res.status(500).json({ success: false, error: mailerStatus.lastError });
   }
 });
@@ -1077,7 +1114,9 @@ app.listen(CONFIG.PORT, () => {
   console.log(`✓ Pi Wallet Monitor API listening on :${CONFIG.PORT}`);
   startScheduler();
   startPaymentStream();
-  // Verify Brevo credentials against /v3/account at boot and every hour after.
+  // Initialize the Gmail SMTP transporter and verify credentials at boot,
+  // then re-verify hourly (surfaces revoked app passwords / auth changes).
+  initTransporter();
   verifyMailer();
   setInterval(verifyMailer, 60 * 60 * 1000);
 });
