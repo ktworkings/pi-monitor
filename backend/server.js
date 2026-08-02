@@ -956,6 +956,10 @@ app.get('/api/wallets', authRequired, (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = (page - 1) * limit;
+  // Filter/sort mode. `all` preserves the historical default (unclaimed → upcoming → newest).
+  // `balance` shows only funded wallets, richest first. `unlocked` shows only wallets sitting
+  // on claimable-now PI. `locked` shows only wallets with still-locked claimables.
+  const filter = (req.query.filter || 'all').toLowerCase();
 
   const allWallets = Array.from(wallets.values());
   const enriched = allWallets.map(w => {
@@ -997,32 +1001,70 @@ app.get('/api/wallets', authRequired, (req, res) => {
     };
   });
 
-  enriched.sort((a, b) => {
-    const aUnclaimed = a.unlocked_unclaimed_count > 0;
-    const bUnclaimed = b.unlocked_unclaimed_count > 0;
-    if (aUnclaimed && !bUnclaimed) return -1;
-    if (!aUnclaimed && bUnclaimed) return 1;
-    if (aUnclaimed && bUnclaimed) return parseFloat(b.unlocked_unclaimed_total) - parseFloat(a.unlocked_unclaimed_total);
+  // Locked = claimables still in lockup (not yet claimable_now). Precompute a count
+  // once so the `locked` filter and its sort don't scan the array twice per wallet.
+  for (const w of enriched) {
+    w._locked_count = (w.claimables || []).filter(cb => !cb.is_claimable_now).length;
+  }
 
-    const aUpcoming = !!a.earliest_unlock;
-    const bUpcoming = !!b.earliest_unlock;
-    if (aUpcoming && !bUpcoming) return -1;
-    if (!aUpcoming && bUpcoming) return 1;
-    if (aUpcoming && bUpcoming) return new Date(a.earliest_unlock) - new Date(b.earliest_unlock);
+  let filtered = enriched;
+  switch (filter) {
+    case 'balance':
+      // Only funded wallets, richest first.
+      filtered = enriched.filter(w => parseFloat(w.available_balance || 0) > 0);
+      filtered.sort((a, b) => parseFloat(b.available_balance) - parseFloat(a.available_balance));
+      break;
 
-    return new Date(b.created_at) - new Date(a.created_at);
-  });
+    case 'unlocked':
+      // Wallets sitting on unlocked-but-unclaimed PI, biggest pile first.
+      filtered = enriched.filter(w => w.unlocked_unclaimed_count > 0);
+      filtered.sort((a, b) => parseFloat(b.unlocked_unclaimed_total) - parseFloat(a.unlocked_unclaimed_total));
+      break;
 
-  const paginated = enriched.slice(offset, offset + limit);
+    case 'locked':
+      // Wallets with claimables still in lockup, soonest unlock first.
+      filtered = enriched.filter(w => w._locked_count > 0);
+      filtered.sort((a, b) => {
+        if (!a.earliest_unlock && !b.earliest_unlock) return 0;
+        if (!a.earliest_unlock) return 1;
+        if (!b.earliest_unlock) return -1;
+        return new Date(a.earliest_unlock) - new Date(b.earliest_unlock);
+      });
+      break;
+
+    case 'all':
+    default:
+      // Historical default: unclaimed → upcoming unlocks → newest added.
+      filtered.sort((a, b) => {
+        const aUnclaimed = a.unlocked_unclaimed_count > 0;
+        const bUnclaimed = b.unlocked_unclaimed_count > 0;
+        if (aUnclaimed && !bUnclaimed) return -1;
+        if (!aUnclaimed && bUnclaimed) return 1;
+        if (aUnclaimed && bUnclaimed) return parseFloat(b.unlocked_unclaimed_total) - parseFloat(a.unlocked_unclaimed_total);
+
+        const aUpcoming = !!a.earliest_unlock;
+        const bUpcoming = !!b.earliest_unlock;
+        if (aUpcoming && !bUpcoming) return -1;
+        if (!aUpcoming && bUpcoming) return 1;
+        if (aUpcoming && bUpcoming) return new Date(a.earliest_unlock) - new Date(b.earliest_unlock);
+
+        return new Date(b.created_at) - new Date(a.created_at);
+      });
+      break;
+  }
+
+  // Strip the internal helper before sending down the wire.
+  const paginated = filtered.slice(offset, offset + limit).map(({ _locked_count, ...rest }) => rest);
   res.json({
     success: true,
     wallets: paginated,
+    filter,
     stats: cachedStats,
     pagination: {
       page,
       limit,
-      total: enriched.length,
-      pages: Math.ceil(enriched.length / limit),
+      total: filtered.length,
+      pages: Math.ceil(filtered.length / limit),
     },
   });
 });

@@ -453,3 +453,48 @@ td {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* Wallet filter bar — segmented control above the monitored wallets table */
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  background: #0c1c2c;
+  border: 1px solid #17324a;
+  border-radius: 8px;
+}
+
+.filter-btn {
+  background: transparent;
+  color: #8aa2b8;
+  border: 1px solid #17324a;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.filter-btn:hover {
+  color: #e6f1fb;
+  border-color: #00d4ff;
+}
+
+.filter-btn.is-active {
+  color: #04121f;
+  background: #00d4ff;
+  border-color: #00d4ff;
+}
+
+.filter-count {
+  margin-left: auto;
+  color: #778;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}

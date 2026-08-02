@@ -1,8 +1,9 @@
 // In development (vite dev server), usew relative URLs so the Vite proxy forwards to localhost:3010.
 // In production (built/deployed), use thee deployed backend URL.
 
-const API_BASE = import.meta.env.DEV ? '' : 'https://pi-monitor-ny8e.onrender.com';
-// const API_BASE = import.meta.env.DEV ? '' : 'http://localhost:3010';
+// const API_BASE = import.meta.env.DEV ? '' : 'https://pi-monitor-ny8e.onrender.com';
+// const API_BASE = 'https://pimonitor.alwaysdata.net';
+const API_BASE = 'http://localhost:3010';
 
 export function getToken() {
   return localStorage.getItem('authToken');
@@ -50,8 +51,9 @@ export async function verifyToken() {
   return request('/api/verify-token');
 }
 
-export async function getWallets(page = 1, limit = 50) {
-  return request(`/api/wallets?page=${page}&limit=${limit}`);
+export async function getWallets(page = 1, limit = 50, filter = 'all') {
+  const params = new URLSearchParams({ page, limit, filter });
+  return request(`/api/wallets?${params.toString()}`);
 }
 
 export async function addWallets(phrases) {

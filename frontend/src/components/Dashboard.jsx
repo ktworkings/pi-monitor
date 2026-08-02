@@ -157,13 +157,14 @@ function Dashboard({ onLogout }) {
   });
   const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
   const [page, setPage] = useState(1);
+  const [filter, setFilter] = useState('all');
   const [phrases, setPhrases] = useState('');
   const [adding, setAdding] = useState(false);
   const [testingEmail, setTestingEmail] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const data = await getWallets(page, 50);
+      const data = await getWallets(page, 50, filter);
       if (data.success) {
         setWallets(data.wallets);
         setPagination(data.pagination);
@@ -174,7 +175,15 @@ function Dashboard({ onLogout }) {
     } catch (err) {
       console.error('Failed to refresh:', err);
     }
-  }, [page]);
+  }, [page, filter]);
+
+  // Changing the filter resets to the first page so the user isn't stranded
+  // on a page number that no longer exists in the smaller filtered set.
+  const handleFilterChange = (next) => {
+    if (next === filter) return;
+    setFilter(next);
+    setPage(1);
+  };
 
   useEffect(() => {
     refresh();
@@ -357,8 +366,35 @@ function Dashboard({ onLogout }) {
             <span className="page-info"> — Page {pagination.page} of {pagination.pages} ({pagination.total} total)</span>
           )}
         </div>
+
+        <div className="filter-bar" role="tablist" aria-label="Wallet filter">
+          {[
+            { key: 'all',      label: 'All Wallets' },
+            { key: 'balance',  label: 'Highest Balance' },
+            { key: 'unlocked', label: 'Unlocked PI' },
+            { key: 'locked',   label: 'Locked PI' },
+          ].map(opt => (
+            <button
+              key={opt.key}
+              role="tab"
+              aria-selected={filter === opt.key}
+              className={`filter-btn ${filter === opt.key ? 'is-active' : ''}`}
+              onClick={() => handleFilterChange(opt.key)}
+            >
+              {opt.label}
+            </button>
+          ))}
+          <span className="filter-count">
+            {pagination.total} match{pagination.total === 1 ? '' : 'es'}
+          </span>
+        </div>
+
         {wallets.length === 0 ? (
-          <div className="empty">No wallets yet</div>
+          <div className="empty">
+            {filter === 'all'
+              ? 'No wallets yet'
+              : 'No wallets match this filter'}
+          </div>
         ) : (
           <>
             <div className="tbl-outer">
