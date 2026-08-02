@@ -34,6 +34,7 @@ app.use(cors({
 
 const CONFIG = {
   PORT: parseInt(process.env.PORT) || 3010,
+  IP: parseInt(process.env.IP) || "0.0.0.0",
   HORIZON_URL: process.env.HORIZON_URL || 'https://api.mainnet.minepi.com',
   RESERVE_PI: parseInt(process.env.RESERVE_PI) || 1,
 
