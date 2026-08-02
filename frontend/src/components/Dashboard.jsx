@@ -154,6 +154,8 @@ function Dashboard({ onLogout }) {
     email_retries: 0,
     email_dropped: 0,
     email_throttled: false,
+    filtered_multisig: 0,
+    filtered_last_reason: null,
   });
   const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, pages: 0 });
   const [page, setPage] = useState(1);
@@ -328,6 +330,14 @@ function Dashboard({ onLogout }) {
           <b>Mail queue</b> {stats.email_queue_depth || 0}
           {stats.email_retries > 0 && ` · ${stats.email_retries} retries`}
           {stats.email_dropped > 0 && ` · ${stats.email_dropped} dropped`}
+        </span>
+        <span
+          className={`sys-item ${stats.filtered_multisig > 0 ? 'sys-warn' : ''}`}
+          title={stats.filtered_last_reason
+            ? `Last: ${stats.filtered_last_reason}`
+            : 'Wallets removed because the master key alone cannot sign a payment'}
+        >
+          <b>Filtered (multi-sig)</b> {stats.filtered_multisig || 0}
         </span>
         <button
           className="sys-btn"

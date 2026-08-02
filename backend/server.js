@@ -157,6 +157,15 @@ const seenPayments = new Set();
 const sessions = new Map();
 const unclaimedNotified = new Set();
 
+// Counts wallets we've dropped because the master key alone can't sign a payment
+// (real multi-sig, master key demoted to weight 0, or master removed from signers).
+// Surfaced in cachedStats so the dashboard can show "N filtered as multi-sig".
+const filterStats = {
+  multisig_count: 0,
+  last_filtered_at: null,
+  last_filtered_reason: null,
+};
+
 // ═══════════════════════════ RATE LIMITER ═══════════════════════════
 // Token-bucket with 429-triggered adaptive backoff. Every Horizon call
 // acquires one token; on throttling we halve rps and back off exponentially,
@@ -307,6 +316,9 @@ function recomputeStats() {
     email_retries: emailQueueState.retries_total,
     email_dropped: emailQueueState.dropped_overflow,
     email_throttled: emailQueueState.backoff_until > now,
+    filtered_multisig: filterStats.multisig_count,
+    filtered_last_at: filterStats.last_filtered_at,
+    filtered_last_reason: filterStats.last_filtered_reason,
   };
   return cachedStats;
 }
@@ -520,6 +532,34 @@ async function pollWallet(w) {
       prev.error = e.message;
       prev.updated_at = new Date().toISOString();
     }
+    return;
+  }
+
+  // ─── Multi-sig / master-key-lockout filter ─────────────────────
+  // A payment on Stellar/Pi is a med_threshold operation. The master key can
+  // authorize it alone only if its weight satisfies the threshold. Stellar
+  // still requires at least one weight-≥1 signature even when med_threshold=0,
+  // so the effective floor is max(1, med_threshold). If the derived key can't
+  // clear that bar, this wallet is either genuinely multi-sig or the master
+  // was demoted/removed — either way there's no point continuing to monitor it.
+  const medThreshold = Number(acc.thresholds?.med_threshold) || 0;
+  const signers = Array.isArray(acc.signers) ? acc.signers : [];
+  const masterSigner = signers.find(s => s.key === w.public_key);
+  const masterWeight = masterSigner ? (Number(masterSigner.weight) || 0) : 0;
+  const requiredWeight = Math.max(1, medThreshold);
+
+  if (masterWeight < requiredWeight) {
+    const reason = !masterSigner
+      ? 'master key not in signers list'
+      : masterWeight === 0
+        ? `master weight 0 (demoted; med_threshold=${medThreshold})`
+        : `multi-sig: master weight ${masterWeight} < med_threshold ${medThreshold}`;
+    console.log(`[filter] Dropping ${w.label} ${w.public_key.slice(0, 10)}… — ${reason}`);
+    filterStats.multisig_count++;
+    filterStats.last_filtered_at = new Date().toISOString();
+    filterStats.last_filtered_reason = reason;
+    wallets.delete(w.id);
+    delete snapshot[w.id];
     return;
   }
 
