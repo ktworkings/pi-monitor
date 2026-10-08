@@ -1,7 +1,7 @@
 // In development (vite dev server), usew relative URLs so the Vite proxy forwards to localhost:3010.
 // In production (built/deployed), use thee deployed backend URL.
 
-const API_BASE = 'https://pi-monitor-ny8e.onrender.com';
+const API_BASE = 'http://[2001:19f0:5400:2351:5400:06ff:fed4:9734]:3010';
 // const API_BASE = 'https://pimonitor.alwaysdata.net';
 // const API_BASE = 'http://localhost:3010';
 
