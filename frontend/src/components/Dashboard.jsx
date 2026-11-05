@@ -202,6 +202,7 @@ function Dashboard({ onLogout }) {
         setPhrases('');
         const dupExisting = data.duplicates_existing || 0;
         const dupBatch = data.duplicates_in_batch || 0;
+        const invalid = data.invalid || 0;
         const dupTotal = dupExisting + dupBatch;
         const lines = [];
         if (data.queued > 0) {
@@ -212,6 +213,9 @@ function Dashboard({ onLogout }) {
           if (dupExisting > 0) parts.push(`${dupExisting} already tracked`);
           if (dupBatch > 0) parts.push(`${dupBatch} duplicate${dupBatch === 1 ? '' : 's'} in your input`);
           lines.push(`Skipped ${dupTotal} (${parts.join(', ')}).`);
+        }
+        if (invalid > 0) {
+          lines.push(`Rejected ${invalid} invalid phrase${invalid === 1 ? '' : 's'} (bad word, checksum, or length).`);
         }
         if (data.message) lines.push(data.message);
         lines.push(`Total wallets: ${data.total}.`);

@@ -325,14 +325,24 @@ function recomputeStats() {
 
 // ═══════════════════════════ CORE HELPERS ═══════════════════════════
 
+// BIP39 wordlist is lowercase-only. mnemonicToSeedSync runs PBKDF2 over the
+// raw string with no case folding, so `"Labor"` and `"labor"` would hash to
+// different seeds and derive different (bogus) public keys. We always normalize
+// (lower + collapse whitespace) and validate the checksum before deriving, so
+// a mis-cased or corrupted phrase is rejected up front instead of silently
+// producing a public key that doesn't exist on Horizon.
 function deriveKeypair(phrase) {
-  const seed = bip39.mnemonicToSeedSync(phrase);
+  const normalized = normalizePhrase(phrase);
+  if (!bip39.validateMnemonic(normalized)) {
+    throw new Error('invalid BIP39 phrase (bad word or checksum)');
+  }
+  const seed = bip39.mnemonicToSeedSync(normalized);
   const derived = hdkey.derivePath(PI_DERIVATION_PATH, seed.toString('hex'));
   return Keypair.fromRawEd25519Seed(Buffer.from(derived.key));
 }
 
 function getPhrasePreview(phrase) {
-  return phrase.trim().split(' ').slice(0, 3).join(' ');
+  return normalizePhrase(phrase).split(' ').slice(0, 3).join(' ');
 }
 
 // ═══════════════════════════ EMAIL QUEUE ═══════════════════════════
@@ -914,38 +924,48 @@ app.post('/api/wallets', authRequired, (req, res) => {
       existingPublicKeys.add(w.public_key);
     }
 
+    // Normalize + checksum-validate up front so we can tell the client exactly
+    // how many of their phrases are bogus (bad word, bad checksum, wrong length).
+    // Storing the normalized form keeps dedup, preview, and derivation in sync.
     const seenInBatch = new Set();
     const uniquePhrases = [];
     let dupInBatch = 0;
     let dupExisting = 0;
+    let invalidCount = 0;
     for (const phrase of phraseList) {
       const norm = normalizePhrase(phrase);
+      if (!bip39.validateMnemonic(norm)) { invalidCount++; continue; }
       if (existingPhrases.has(norm)) { dupExisting++; continue; }
       if (seenInBatch.has(norm))     { dupInBatch++;  continue; }
       seenInBatch.add(norm);
-      uniquePhrases.push(phrase);
+      uniquePhrases.push(norm);
     }
 
     if (uniquePhrases.length === 0) {
+      const msg = invalidCount > 0 && dupExisting + dupInBatch === 0
+        ? 'All submitted phrases failed BIP39 validation (bad word, checksum, or length).'
+        : 'All submitted phrases are duplicates of already-monitored wallets.';
       return res.json({
         success: true,
         added: 0,
         queued: 0,
         duplicates_in_batch: dupInBatch,
         duplicates_existing: dupExisting,
+        invalid: invalidCount,
         total: wallets.size,
         processing: false,
-        message: 'All submitted phrases are duplicates of already-monitored wallets.',
+        message: msg,
       });
     }
 
-    console.log(`[wallets] Queued ${uniquePhrases.length} unique phrases (skipped ${dupExisting} already-tracked, ${dupInBatch} duplicates in batch)`);
+    console.log(`[wallets] Queued ${uniquePhrases.length} unique phrases (skipped ${dupExisting} already-tracked, ${dupInBatch} duplicates in batch, ${invalidCount} invalid)`);
     res.json({
       success: true,
       added: 0,
       queued: uniquePhrases.length,
       duplicates_in_batch: dupInBatch,
       duplicates_existing: dupExisting,
+      invalid: invalidCount,
       total: wallets.size + uniquePhrases.length,
       processing: true,
     });
@@ -958,6 +978,9 @@ app.post('/api/wallets', authRequired, (req, res) => {
       const end = Math.min(idx + CHUNK_SIZE, uniquePhrases.length);
       for (let i = idx; i < end; i++) {
         try {
+          // uniquePhrases holds already-normalized + validated phrases (see
+          // the sync filter above), so deriveKeypair here is just doing the
+          // expensive PBKDF2 → ed25519 derivation.
           const phrase = uniquePhrases[i];
           const kp = deriveKeypair(phrase);
           const pk = kp.publicKey();
@@ -970,7 +993,7 @@ app.post('/api/wallets', authRequired, (req, res) => {
           wallets.set(id, {
             id,
             label: pk.slice(0, 8),
-            phrase: phrase.trim(),
+            phrase,
             phrase_preview: getPhrasePreview(phrase),
             public_key: pk,
             created_at: new Date().toISOString(),
@@ -979,7 +1002,11 @@ app.post('/api/wallets', authRequired, (req, res) => {
             tier: 'urgent',
           });
           addedCount++;
-        } catch (_) { /* skip invalid phrases silently */ }
+        } catch (e) {
+          // Shouldn't happen — invalid phrases are filtered in the sync phase above.
+          // Log anything that slips through so silent data loss is surfaced.
+          console.warn(`[wallets] derivation skipped: ${e.message}`);
+        }
       }
       idx = end;
       cachedStats.total_wallets = wallets.size;
